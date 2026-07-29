@@ -24,26 +24,88 @@ Eight stages across the Bowtie — Awareness, Education, Selection, Commit, Onbo
 | **NRR / GRR by Cohort** | Is retention structural or is one quarter dragging the average? |
 | **Stage Velocity** | Are cycle times degrading over time, or was one quarter noisy? |
 
-Below the tabs, the **RevOps Diagnostic Advisor** (Claude Sonnet 4.6, adaptive thinking) receives the current filtered snapshot plus your ACV band, segment and GTM motion. It applies Bowtie benchmarks, anchors every number to your context before citing it, distinguishes structural trends from one-quarter blips, and declines to invent benchmarks it does not have sourced.
+Below the tabs, the **RevOps Diagnostic Advisor** (Claude Sonnet 4.6, adaptive thinking) receives a compact headline snapshot plus your ACV band, segment and GTM motion, and calls tools for anything deeper. It applies Bowtie benchmarks, anchors every number to your context before citing it, distinguishes structural trends from one-quarter blips, and declines to invent benchmarks it does not have sourced.
+
+## Project structure
+
+```
+metrics/       Pure computation, no Streamlit import: stage volumes, conversion
+               rates, NRR/GRR, z-score anomalies, the bowtie chart's data prep.
+               Single source of truth — app.py, advisor/tools.py, and
+               mcp_server/server.py all call the same functions.
+data/          generate.py (the seeded synthetic-data generator) and
+               loader.py (CSV -> the two dataframes everything else uses).
+advisor/       The diagnostic advisor: persona.py (system-prompt persona),
+               tools.py (the three tools + their handlers), context.py
+               (system-prompt assembly), loop.py (the tool-use loop).
+charts/        Plotly figure builders. Only the bowtie diagram gets its own
+               module — the simpler per-tab charts stay inline in app.py.
+mcp_server/    Standalone MCP server exposing the same three tools to
+               Claude Desktop or any other MCP client. See below.
+tests/         pytest over metrics/ and advisor/tools.py, run in CI on
+               every push (.github/workflows/tests.yml).
+app.py         Streamlit UI only — five tabs, sidebar filters, the chat
+               surface. Imports everything else; defines nothing itself
+               beyond page config, CSS, and the chat loop's glue code.
+```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    CSV[bowtie_data.csv<br/>synthetic transition log] --> LOAD[load_data<br/>cached]
+    CSV[bowtie_data.csv<br/>synthetic transition log] --> LOAD[data/loader.py<br/>cached in app.py]
     LOAD --> FILTER[Sidebar filters<br/>segment / motion / cohort / rep]
-    FILTER --> METRICS[Metric layer<br/>stage volumes · conversion<br/>NRR/GRR · z-score anomalies]
+    FILTER --> METRICS[metrics/<br/>stage volumes · conversion<br/>NRR/GRR · z-score anomalies]
     METRICS --> TABS[5 Plotly tabs]
-    METRICS --> SNAP[compute_summary_stats<br/>JSON snapshot]
+    METRICS --> SNAP[compute_headline_snapshot<br/>compact JSON]
     PROFILE[Company profile<br/>ACV · segment · motion] --> CTX[build_company_context]
     SNAP --> SYS[System prompt]
     CTX --> SYS
     PERSONA[Advisor persona<br/>WbD benchmarks · SPICED<br/>anchoring rules] --> SYS
-    SYS --> API[Anthropic Messages API]
+    SYS --> LOOP[advisor/loop.py<br/>tool-use loop]
+    TOOLS[advisor/tools.py<br/>get_stage_health<br/>diagnose_conversion_drop<br/>recommend_play] <--> LOOP
+    LOOP --> API[Anthropic Messages API]
     API --> CHAT[Diagnostic chat]
+    TOOLS -.same handlers.-> MCP[mcp_server/server.py]
+    MCP --> DESKTOP[Claude Desktop]
 ```
 
-The metric layer is the single source of truth: the same functions feed the charts and the model's context, so the advisor cannot cite a number the dashboard does not show.
+The metric layer is the single source of truth: the same functions feed the charts, the advisor's tools, and the standalone MCP server, so none of the three can ever disagree about a number.
+
+## Tool calling and MCP
+
+The advisor used to receive one large JSON dump on every question — every cohort's NRR/GRR, every stage's days-in-stage, the full conversion-rate table — regardless of what was actually asked. That's a **workflow**: fixed steps, no choices. It's now an **agent**: the system prompt carries only a compact headline snapshot (stage volumes, overall GRR/NRR, flagged anomalies, segment and motion performance), and three tools let Claude ask for anything deeper:
+
+- **`get_stage_health(stage, segment?, motion?, cohort?)`** — conversion in/out, days-in-stage, and any anomalies touching one stage.
+- **`diagnose_conversion_drop(from_stage, to_stage, segment?, motion?)`** — one transition's full per-cohort history and whether any quarter is flagged.
+- **`recommend_play(leak_stage)`** — the canonical Winning by Design intervention for a leak, looked up from a structured table rather than recited from memory.
+
+The difference is concrete, not just architectural: the per-request data payload dropped from roughly 8.9K characters (the old full dump) to about 2.3K (the new headline snapshot) — the removed detail is now fetched only when a question actually needs it. Ask "what about Enterprise specifically?" and the advisor calls `get_stage_health` with `segment="Enterprise"` instead of reasoning from a blended figure it already had sitting in context.
+
+The loop itself (`advisor/loop.py`) is a **hand-rolled request → tool call → tool result → repeat cycle**, not the Anthropic SDK's beta tool runner. That's deliberate: the point of this project is being able to explain exactly how the agentic loop works, and a manual loop is more transparent than a helper that hides the cycle. It also means no beta SDK dependency for three tools this small.
+
+**Consuming an MCP server is table stakes; authoring one is the actual credibility signal.** `mcp_server/server.py` exposes the same three tools — backed by the identical handler functions in `advisor/tools.py` — over the Model Context Protocol, so Claude Desktop (or any other MCP client) can query this dataset directly, with no Streamlit app in the loop at all.
+
+To run it locally and wire it into Claude Desktop:
+
+```bash
+pip install -r mcp_server/requirements.txt
+```
+
+Add this to Claude Desktop's config file (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows: `%APPDATA%\Claude\claude_desktop_config.json`), using the absolute path to the Python interpreter you just installed into and the absolute path to this repo:
+
+```json
+{
+  "mcpServers": {
+    "gtm-bowtie-diagnostic": {
+      "command": "/absolute/path/to/gtm-health-diagnostic/.venv/bin/python",
+      "args": ["/absolute/path/to/gtm-health-diagnostic/mcp_server/server.py"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop, and `get_stage_health`, `diagnose_conversion_drop`, and `recommend_play` appear as tools you can call directly in a conversation — the same diagnostic logic as the dashboard, without the dashboard.
 
 ## Methodology
 
@@ -63,9 +125,9 @@ All deal values, ARR and expansion revenue are **EUR**. The Winning by Design Ta
 
 `bowtie_data.csv` is generated by `data/generate.py` — a seeded, committed script, not a hand-edited or opaque file. Re-running it reproduces the exact same CSV; changing a parameter and re-running it is how the dataset gets tuned, not by editing rows.
 
-It holds two record types. Awareness and Education are too large to enumerate per lead, so they appear as `aggregate` rows carrying `count_entered` and `count_exited` per segment per cohort, shared across both GTM motions. From Selection onward, `deal` rows are a genuine **transition log**: a deal that reaches Expansion contributes one row for every stage it occupied — Selection, Commit, Onboarding, Adoption, Renewal, Expansion — all sharing one `deal_id`. Exactly one of those rows, wherever the deal's journey ends, has an empty `stage_exited`; the app's `_deal_snapshot()` filters on that to recover one row per deal for ARR and retention math, while the full multi-row log drives stage-level conversion and velocity math, where one row per deal per stage is exactly what's wanted.
+It holds two record types. Awareness and Education are too large to enumerate per lead, so they appear as `aggregate` rows carrying `count_entered` and `count_exited` per segment per cohort, shared across both GTM motions. From Selection onward, `deal` rows are a genuine **transition log**: a deal that reaches Expansion contributes one row for every stage it occupied — Selection, Commit, Onboarding, Adoption, Renewal, Expansion — all sharing one `deal_id`. Exactly one of those rows, wherever the deal's journey ends, has an empty `stage_exited`; `metrics.deal_snapshot()` filters on that to recover one row per deal for ARR and retention math, while the full multi-row log drives stage-level conversion and velocity math, where one row per deal per stage is exactly what's wanted.
 
-This matters concretely: summing `deal_value` across a deal's postsale rows would count its ARR once per stage it reached rather than once. Every NRR/GRR/churn-rate calculation in `app.py` goes through the snapshot for exactly that reason — it's not a stylistic choice, it's what makes the multi-row model safe to aggregate.
+This matters concretely: summing `deal_value` across a deal's postsale rows would count its ARR once per stage it reached rather than once. Every NRR/GRR/churn-rate calculation — in the dashboard, the advisor's tools, and the MCP server — goes through `deal_snapshot()` for exactly that reason. It's not a stylistic choice; it's what makes the multi-row model safe to aggregate, and `tests/test_metrics.py` has a regression test asserting the raw log overcounts and the snapshot doesn't.
 
 The generator also injects one deliberate, real anomaly — an Enterprise/Sales-led win-rate collapse in a specific quarter — so the anomaly detector on the Conversion Rates tab has something genuine to find rather than a permanently clean bill of health. Every other quarter is left to ordinary sampling noise, which produces its own smaller, unplanned anomalies alongside the injected one.
 
@@ -88,7 +150,9 @@ Naming what was left out, and why, matters as much as what shipped.
 - **Streamlit** — app shell, filters, chat surface
 - **Pandas / NumPy** — stage-transition maths, cohort aggregation, z-score anomaly scoring
 - **Plotly** — bowtie diagram and all charts
-- **Anthropic API** (`claude-sonnet-4-6`, adaptive thinking) — the diagnostic advisor
+- **Anthropic API** (`claude-sonnet-4-6`, adaptive thinking) — the diagnostic advisor, driven through a hand-rolled tool-use loop
+- **MCP Python SDK** (`mcp_server/`, kept out of the main app's dependencies) — the standalone MCP server
+- **pytest**, run in CI on every push (`.github/workflows/tests.yml`) — the metrics layer and the advisor's tools
 
 ## Run locally
 
@@ -118,15 +182,21 @@ python data/generate.py
 
 Run from the repo root — it overwrites `bowtie_data.csv` in place and prints a validation summary (row counts, GRR/NRR by segment, and a check that no stage transition lands at exactly 100% or 0%).
 
+To run the test suite:
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
 ## Roadmap
 
-In the order I intend to build them:
+**Next: HubSpot connector.** A Demo/Live toggle pulling deals from a developer sandbox via the Deals API, mapping pipeline stages to bowtie stages through a custom property. The diagnostic logic does not change; it is a data source swap.
 
-1. **Move the advisor from context-stuffing to tool calling.** Today it receives a pre-computed JSON snapshot. Exposing `get_stage_health`, `diagnose_conversion_drop` and `recommend_play` as tools lets it query the data it actually needs — a workflow becoming an agent.
-2. **Publish those same tools over MCP**, so the diagnostic can be used from Claude Desktop as well as from this app.
-3. **HubSpot connector.** A Demo/Live toggle pulling deals from a developer sandbox via the Deals API, mapping pipeline stages to bowtie stages through a custom property. The diagnostic logic does not change; it is a data source swap.
-
-**Done:** a seeded, committed data generator (`data/generate.py`) replaced the opaque CSV — entity-stable `deal_id`s tracing a deal across every stage it occupied, churn weighted to Renewal where the advisor's own benchmarks say it belongs, and separate PLG / Sales-led cohorts so the motion filter and the advisor's PLG-specific reasoning both draw on data that actually exists.
+**Done:**
+- A seeded, committed data generator (`data/generate.py`) replaced the opaque CSV — entity-stable `deal_id`s tracing a deal across every stage it occupied, churn weighted to Renewal where the advisor's own benchmarks say it belongs, and separate PLG / Sales-led cohorts so the motion filter and the advisor's PLG-specific reasoning both draw on data that actually exists.
+- The advisor moved from a single context-stuffed prompt to a real tool-use loop over `get_stage_health`, `diagnose_conversion_drop` and `recommend_play`, and those same tools now run as a standalone MCP server for Claude Desktop — see [Tool calling and MCP](#tool-calling-and-mcp).
+- The codebase split into `metrics/`, `data/`, `advisor/`, `charts/` and `mcp_server/` packages with a pytest suite in CI, so the dashboard, the chat advisor, and the MCP server share one tested source of truth instead of three copies of the same arithmetic.
 
 ---
 

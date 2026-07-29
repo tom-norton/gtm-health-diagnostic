@@ -1,12 +1,47 @@
-import json
 import os
 
 import streamlit as st
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import anthropic
+
+from advisor import (
+    TOOL_SCHEMAS,
+    build_company_context,
+    build_system_prompt,
+    execute_tool,
+    run_advisor_turn,
+)
+from charts import (
+    CHART_BG,
+    CHART_FONT,
+    ENT_COLOR,
+    HAIRLINE,
+    MM_COLOR,
+    PRESALE_COLOR,
+    POSTSALE_COLOR,
+    SEGMENT_COLORS,
+    SMB_COLOR,
+    build_bowtie_fig,
+)
+from data.loader import load_data as _load_data
+from metrics import (
+    DEAL_STAGES,
+    MIN_ABS_DROP_PP,
+    MIN_COHORTS_FOR_ZSCORE,
+    MOTIONS,
+    POSTSALE,
+    SEGMENTS,
+    STAGE_ORDER,
+    ZSCORE_THRESHOLD,
+    compute_bowtie,
+    compute_conversion_anomalies,
+    compute_conversion_rates,
+    compute_headline_snapshot,
+    compute_stage_volumes,
+    deal_snapshot,
+)
 
 st.set_page_config(
     page_title="GTM Health Diagnostic",
@@ -154,37 +189,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── palette (Clay design system) ─────────────────────────────────────────────
-PRESALE_COLOR  = "#ff4d8b"   # brand-pink
-POSTSALE_COLOR = "#1a3a3a"   # brand-teal
-SMB_COLOR      = "#ffb084"   # brand-peach
-MM_COLOR       = "#b8a4ed"   # brand-lavender
-ENT_COLOR      = "#e8b94a"   # brand-ochre
-
-CHART_BG   = "#faf5e8"
-CHART_FONT = "#0a0a0a"
-HAIRLINE   = "#e5e5e5"
-
-STAGE_ORDER = [
-    "Awareness", "Education", "Selection", "Commit",
-    "Onboarding", "Adoption", "Renewal", "Expansion",
-]
-PRESALE  = STAGE_ORDER[:4]
-POSTSALE = STAGE_ORDER[4:]
-
-# Awareness and Education are too large to enumerate per-deal, so the dataset
-# stores them as a single aggregate row per cohort (count_entered/count_exited).
-# Selection onward have one row per deal per stage occupied.
-AGGREGATE_STAGES = ["Awareness", "Education"]
-DEAL_STAGES = [s for s in STAGE_ORDER if s not in AGGREGATE_STAGES]
-
-SEGMENTS = ["SMB", "Mid-Market", "Enterprise"]
-SEGMENT_COLORS = {"SMB": SMB_COLOR, "Mid-Market": MM_COLOR, "Enterprise": ENT_COLOR}
-
-# GTM motion is a deal-level dimension from Selection onward; Awareness/
-# Education aggregate rows are motion-agnostic (shared top-of-funnel pool).
-MOTIONS = ["Sales-led", "PLG"]
-
 # The deployed demo runs on a personal Anthropic key, so each browser session
 # gets a fixed question budget. Streamlit session state resets on refresh, which
 # makes this a courtesy limit rather than a security control — it stops a casual
@@ -196,636 +200,9 @@ AUTHOR_NAME = "Tom Norton"
 AUTHOR_LINKEDIN = "https://www.linkedin.com/in/tom-p-norton/"
 AUTHOR_REPO = "https://github.com/tom-norton/gtm-health-diagnostic"
 
-# ── bowtie chart constants ────────────────────────────────────────────────────
-_BT_LEFT   = ["Awareness", "Education", "Selection"]
-_BT_CENTER = "Commit"
-_BT_RIGHT  = ["Onboarding", "Adoption", "Renewal", "Expansion"]
-_BT_STAGES = _BT_LEFT + [_BT_CENTER] + _BT_RIGHT
-
-_BT_COLORS = {
-    "Awareness":  "#ff4d8b",   # brand-pink
-    "Education":  "#e8457e",
-    "Selection":  "#cc3b70",
-    "Commit":     "#1a3a3a",   # brand-teal
-    "Onboarding": "#1a4a4a",
-    "Adoption":   "#1a5f5f",
-    "Renewal":    "#1a6868",
-    "Expansion":  "#1a7070",
-}
-_BT_BLK_W = 1.5
-_BT_GAP   = 0.40
-_BT_MAX_H = 1.0
-_BT_MUTED = "#9a9a9a"   # muted-soft
-
 # ── data ─────────────────────────────────────────────────────────────────────
-# `deal` is a true transition log: a deal that reaches Expansion contributes
-# one row per stage occupied (Selection, Commit, Onboarding, Adoption,
-# Renewal, Expansion), all sharing one deal_id. Counting rows per stage is
-# therefore safe everywhere (each deal has exactly one row per stage it
-# passed through), but SUMMING deal_value/expansion_revenue across multiple
-# postsale rows for the same deal overcounts its ARR once per stage it
-# reached. `_deal_snapshot()` below recovers one row per deal -- its
-# terminal stage, win or churn -- for exactly that kind of ARR/retention
-# math. See data/generate.py for how the CSV is produced.
-@st.cache_data
-def load_data():
-    raw = pd.read_csv("bowtie_data.csv")
-    raw["cohort_quarter"] = raw["cohort_quarter"].astype(str)
-
-    agg = raw[raw["record_type"] == "aggregate"].copy()
-    agg["count_entered"] = agg["count_entered"].astype(int)
-    agg["count_exited"]  = agg["count_exited"].astype(int)
-    agg["days_in_stage"] = pd.to_numeric(agg["days_in_stage"], errors="coerce")
-    agg = agg[["cohort_quarter", "stage_entered", "stage_exited",
-               "count_entered", "count_exited", "segment", "days_in_stage"]]
-
-    deal = raw[raw["record_type"] == "deal"].copy()
-    deal["conversion_date"] = pd.to_datetime(deal["conversion_date"])
-    deal["churned"]         = deal["churned"].astype(str).str.lower() == "true"
-    deal["stage_exited"]      = deal["stage_exited"].fillna("")
-    deal["expansion_revenue"] = pd.to_numeric(deal["expansion_revenue"], errors="coerce").fillna(0)
-    deal["stage_entered"]     = pd.Categorical(deal["stage_entered"], categories=STAGE_ORDER, ordered=True)
-    deal["activated"] = deal["activated"].map({"True": True, "False": False, True: True, False: False})
-    deal = deal.drop(columns=["record_type", "count_entered", "count_exited"])
-
-    return agg, deal
-
-
-def _deal_snapshot(deal_data):
-    """One row per distinct deal_id: its terminal stage, whether that means
-    reaching Expansion or churning earlier. Every deal's chain of per-stage
-    rows has exactly one row with an empty stage_exited -- the stage where
-    its journey ended -- which is what this filters on. Use this, never the
-    full per-stage log, for ARR / NRR / GRR / churn-rate math: summing
-    deal_value across a deal's multiple stage rows counts its ARR once per
-    stage it reached rather than once."""
-    return deal_data[deal_data["stage_exited"] == ""]
-
-
+load_data = st.cache_data(_load_data)
 agg_df, df = load_data()
-
-
-# ── shared stage-volume / conversion-rate helpers ───────────────────────────
-def compute_stage_volumes(deal_data, agg_data):
-    """Count of deals/leads ENTERING each stage. Awareness/Education come
-    from the aggregate rows; Selection onward are counted from deal rows."""
-    vols = {}
-    for stage in AGGREGATE_STAGES:
-        vols[stage] = int(agg_data.loc[agg_data["stage_entered"] == stage, "count_entered"].sum())
-    deal_counts = deal_data.groupby("stage_entered", observed=True)["deal_id"].count()
-    for stage in DEAL_STAGES:
-        vols[stage] = int(deal_counts.get(stage, 0))
-    return pd.Series(vols).reindex(STAGE_ORDER)
-
-
-def compute_conversion_rates(deal_data, agg_data):
-    """Per the cohort-flow model: rate = (count that EXITED into the next
-    stage) / (count that ENTERED this stage)."""
-    rates = []
-    for i in range(len(STAGE_ORDER) - 1):
-        a, b = STAGE_ORDER[i], STAGE_ORDER[i + 1]
-        if a in AGGREGATE_STAGES:
-            sub = agg_data[agg_data["stage_entered"] == a]
-            entered = int(sub["count_entered"].sum())
-            exited  = int(sub["count_exited"].sum())
-        else:
-            entered = int((deal_data["stage_entered"] == a).sum())
-            exited  = int(((deal_data["stage_entered"] == a) & (deal_data["stage_exited"] == b)).sum())
-        rate = round(exited / entered * 100, 1) if entered else 0.0
-        rates.append({"from": a, "to": b, "entered": entered, "exited": exited, "rate_pct": rate})
-    return rates
-
-
-# ── anomaly detection ─────────────────────────────────────────────────────────
-# Z-SCORE_THRESHOLD is negative because we only care about conversion falling,
-# not rising. -1.5 is deliberately loose: with 8 cohort quarters a stricter cut
-# almost never fires, and the point is to start a conversation, not to prove
-# significance on n=8.
-ZSCORE_THRESHOLD = -1.5
-MIN_COHORTS_FOR_ZSCORE = 4
-
-# A z-score alone is not enough. Where a transition is very stable across
-# cohorts its standard deviation is tiny, so a 0.2-point move scores past -2
-# sigma while meaning nothing operationally. Requiring a minimum absolute drop
-# as well is the difference between statistical and practical significance —
-# without it this flags noise and the whole panel loses credibility.
-MIN_ABS_DROP_PP = 3.0
-
-
-def compute_conversion_anomalies(deal_data, agg_data, threshold=ZSCORE_THRESHOLD,
-                                 min_abs_drop_pp=MIN_ABS_DROP_PP):
-    """Flag cohort quarters where a stage's conversion rate is both a
-    statistical outlier and a materially large drop.
-
-    A quarter is flagged only when BOTH hold:
-      * its z-score is at or below `threshold`, computed against that
-        transition's own mean across cohorts, and
-      * it sits at least `min_abs_drop_pp` percentage points below that mean.
-
-    The z-score is computed per transition, never across transitions: a 25%
-    Selection->Commit rate and a 94% Commit->Onboarding rate are both healthy
-    in context, so pooling them would flag the wrong stage every time. A
-    transition is only scored when it has at least MIN_COHORTS_FOR_ZSCORE
-    quarters of history and a non-zero standard deviation."""
-
-    cohorts = sorted(set(deal_data["cohort_quarter"]) | set(agg_data["cohort_quarter"]))
-
-    # rate per transition per cohort
-    per_cohort = {}
-    for cq in cohorts:
-        d = deal_data[deal_data["cohort_quarter"] == cq]
-        a = agg_data[agg_data["cohort_quarter"] == cq]
-        for r in compute_conversion_rates(d, a):
-            if r["entered"] == 0:
-                continue
-            per_cohort.setdefault((r["from"], r["to"]), []).append(
-                {"cohort_quarter": cq, "rate_pct": r["rate_pct"], "entered": r["entered"]}
-            )
-
-    rows = []
-    for (a, b), obs in per_cohort.items():
-        if len(obs) < MIN_COHORTS_FOR_ZSCORE:
-            continue
-        series = np.array([o["rate_pct"] for o in obs], dtype=float)
-        mean, std = series.mean(), series.std(ddof=0)
-        if std == 0:
-            continue
-        for o in obs:
-            z = (o["rate_pct"] - mean) / std
-            drop_pp = float(mean) - o["rate_pct"]
-            rows.append({
-                "transition": f"{a} → {b}",
-                "cohort_quarter": o["cohort_quarter"],
-                "rate_pct": o["rate_pct"],
-                "mean_pct": round(float(mean), 1),
-                "drop_pp": round(drop_pp, 1),
-                "z_score": round(float(z), 2),
-                "entered": o["entered"],
-                "is_anomaly": bool(z <= threshold and drop_pp >= min_abs_drop_pp),
-            })
-
-    rows.sort(key=lambda r: r["z_score"])
-    return rows
-
-
-# ── bowtie helpers ────────────────────────────────────────────────────────────
-def _compute_bowtie(deal_data, agg_data):
-    """All metrics needed to render the bowtie for the given data slice."""
-    vols = compute_stage_volumes(deal_data, agg_data)
-
-    commit_recs = deal_data[deal_data["stage_entered"] == "Commit"]
-    avg_val     = commit_recs["deal_value"].mean() if len(commit_recs) else 0.0
-
-    # Each post-sale stage is counted from its own rows, so the bowtie agrees
-    # with the Conversion Rates tab. (Previously Adoption was derived from the
-    # Onboarding rows' churn flag, which disagreed with the transition log.)
-    def _stage_count(stage):
-        return int((deal_data["stage_entered"] == stage).sum())
-
-    onb_count = _stage_count("Onboarding")
-    adp_count = _stage_count("Adoption")
-    ren_count = _stage_count("Renewal")
-    exp_count = _stage_count("Expansion")
-
-    onb_arr = onb_count * avg_val
-    adp_arr = adp_count * avg_val
-    ren_arr = ren_count * avg_val
-
-    total_exp = float(deal_data["expansion_revenue"].sum())
-    exp_arr   = exp_count * avg_val + total_exp
-    nrr       = round(exp_arr / onb_arr * 100, 1) if onb_arr else 0.0
-
-    # Every consecutive transition uses the same exits/entries model.
-    rates = {}
-    for a, b in zip(_BT_STAGES, _BT_STAGES[1:]):
-        if a in AGGREGATE_STAGES:
-            sub     = agg_data[agg_data["stage_entered"] == a]
-            entered = int(sub["count_entered"].sum())
-            exited  = int(sub["count_exited"].sum())
-        else:
-            entered = int((deal_data["stage_entered"] == a).sum())
-            exited  = int(
-                ((deal_data["stage_entered"] == a) &
-                 (deal_data["stage_exited"]  == b)).sum()
-            )
-        rates[(a, b)] = round(exited / entered * 100, 1) if entered else 0.0
-
-    return dict(
-        vols=vols, avg_val=avg_val,
-        commit_arr=vols.get("Commit", 0) * avg_val,
-        onb_count=onb_count, onb_arr=onb_arr,
-        adp_count=adp_count, adp_arr=adp_arr,
-        ren_count=ren_count, ren_arr=ren_arr,
-        exp_count=exp_count,
-        total_exp=total_exp, exp_arr=exp_arr, nrr=nrr,
-        rates=rates,
-    )
-
-
-def _log_h(vol, ref, max_h=_BT_MAX_H):
-    """Log-normalised half-height so all stages remain visible."""
-    if ref <= 0 or vol <= 0:
-        return max_h * 0.04
-    return np.log1p(vol) / np.log1p(ref) * max_h
-
-
-def _build_bowtie_fig(m, subtitle="All Cohorts"):
-    ref = m["vols"].get("Awareness", 1)
-    avg = m["avg_val"]
-
-    eff = {
-        "Awareness":  m["vols"].get("Awareness", 0),
-        "Education":  m["vols"].get("Education", 0),
-        "Selection":  m["vols"].get("Selection", 0),
-        "Commit":     m["vols"].get("Commit", 0),
-        "Onboarding": m["onb_count"],
-        "Adoption":   m["adp_count"],
-        "Renewal":    m["ren_count"],
-        "Expansion":  int(m["exp_arr"] / avg) if avg else 0,
-    }
-    H = {s: _log_h(eff.get(s, 0), ref) for s in _BT_STAGES}
-
-    X = {}; x = 0.0
-    for s in _BT_STAGES:
-        X[s] = x; x += _BT_BLK_W + _BT_GAP
-
-    RATE_PAIRS = list(zip(_BT_STAGES, _BT_STAGES[1:]))
-
-    fig = go.Figure()
-
-    for i, s in enumerate(_BT_STAGES[:-1]):
-        nxt = _BT_STAGES[i + 1]
-        x0, x1 = X[s] + _BT_BLK_W, X[nxt]
-        h0, h1 = H[s], H[nxt]
-        fig.add_trace(go.Scatter(
-            x=[x0, x1, x1, x0, x0], y=[h0, h1, -h1, -h0, h0],
-            fill="toself", fillcolor=_BT_COLORS[s], opacity=0.28,
-            line=dict(width=0), mode="lines",
-            showlegend=False, hoverinfo="skip",
-        ))
-
-    for s in _BT_STAGES:
-        x0, x1 = X[s], X[s] + _BT_BLK_W
-        h   = H[s]
-        idx = _BT_STAGES.index(s)
-        v   = m["vols"].get(s, 0)
-
-        if s in _BT_LEFT:
-            htxt = f"<b>{s}</b><br>Deals: {v:,}"
-        elif s == _BT_CENTER:
-            htxt = f"<b>Commit</b><br>Deals: {v:,}<br>ARR: €{m['commit_arr']:,.0f}"
-        elif s == "Onboarding":
-            htxt = f"<b>Onboarding</b><br>Deals: {m['onb_count']:,}<br>ARR: €{m['onb_arr']:,.0f}"
-        elif s == "Adoption":
-            htxt = (f"<b>Adoption</b><br>Deals: {m['adp_count']:,}"
-                    f"<br>ARR: €{m['adp_arr']:,.0f}")
-        elif s == "Renewal":
-            htxt = (f"<b>Renewal</b><br>Deals: {m['ren_count']:,}"
-                    f"<br>ARR: €{m['ren_arr']:,.0f}")
-        else:
-            htxt = (f"<b>Expansion (NRR)</b><br>ARR: €{m['exp_arr']:,.0f}"
-                    f"<br>NRR: {m['nrr']:.1f}%<br>Expansion rev: €{m['total_exp']:,.0f}")
-
-        if idx > 0:
-            r_in = m["rates"].get((_BT_STAGES[idx - 1], s))
-            if r_in is not None:
-                htxt += f"<br>Conv in: {r_in:.1f}%"
-        if idx < len(_BT_STAGES) - 1:
-            r_out = m["rates"].get((s, _BT_STAGES[idx + 1]))
-            if r_out is not None:
-                htxt += f"<br>Conv out: {r_out:.1f}%"
-
-        fig.add_trace(go.Scatter(
-            x=[x0, x1, x1, x0, x0], y=[h, h, -h, -h, h],
-            fill="toself", fillcolor=_BT_COLORS[s],
-            line=dict(color="white", width=0.7), mode="lines",
-            showlegend=False,
-            hovertemplate=htxt + "<extra></extra>",
-            name=s,
-        ))
-
-        if s in _BT_LEFT:
-            lbl = f"<b>{s}</b><br>{v:,} deals"
-        elif s == _BT_CENTER:
-            lbl = f"<b>Commit</b><br>{v:,} deals<br>€{m['commit_arr']/1e6:.1f}M ARR"
-        elif s == "Onboarding":
-            lbl = f"<b>Onboarding</b><br>€{m['onb_arr']/1e6:.1f}M ARR"
-        elif s == "Adoption":
-            lbl = f"<b>Adoption</b><br>€{m['adp_arr']/1e6:.1f}M ARR"
-        elif s == "Renewal":
-            lbl = f"<b>Renewal</b><br>€{m['ren_arr']/1e6:.1f}M ARR"
-        else:
-            lbl = f"<b>Expansion</b><br>€{m['exp_arr']/1e6:.1f}M ARR (NRR)"
-
-        fsize = 9 if h < 0.30 else 10 if h < 0.55 else 11
-        fig.add_annotation(
-            x=(x0 + x1) / 2, y=0, text=lbl, showarrow=False,
-            font=dict(color="white", size=fsize),
-            align="center", xanchor="center", yanchor="middle",
-        )
-
-    for a, b in RATE_PAIRS:
-        xm    = (X[a] + _BT_BLK_W + X[b]) / 2
-        rate  = m["rates"].get((a, b), 0.0)
-        y_lbl = -(min(H[a], H[b]) + 0.09)
-        label = f"{rate:.1f}%"
-        fig.add_annotation(
-            x=xm, y=y_lbl, text=label, showarrow=False,
-            font=dict(color=_BT_MUTED, size=9), align="center",
-        )
-
-    x_div = X[_BT_CENTER] + _BT_BLK_W / 2
-    fig.add_shape(
-        type="line", x0=x_div, x1=x_div,
-        y0=-(_BT_MAX_H + 0.06), y1=(_BT_MAX_H + 0.04),
-        line=dict(color=HAIRLINE, dash="dot", width=1.2),
-    )
-    fig.add_annotation(
-        x=X[_BT_CENTER] - 0.1, y=_BT_MAX_H + 0.10,
-        text="Pre-Sale", showarrow=False,
-        font=dict(color="#ff4d8b", size=9), xanchor="right",
-    )
-    fig.add_annotation(
-        x=X[_BT_CENTER] + _BT_BLK_W + 0.1, y=_BT_MAX_H + 0.10,
-        text="Post-Sale", showarrow=False,
-        font=dict(color="#1a7070", size=9), xanchor="left",
-    )
-
-    x_max = X["Expansion"] + _BT_BLK_W + 0.4
-    fig.update_layout(
-        title=dict(
-            text=f"<b>GTM Bowtie</b>  ·  {subtitle}",
-            font=dict(size=14, color=CHART_FONT),
-            x=0.5, xanchor="center",
-        ),
-        xaxis=dict(visible=False, range=[-0.15, x_max]),
-        yaxis=dict(visible=False,
-                   range=[-(_BT_MAX_H + 0.22), _BT_MAX_H + 0.13]),
-        plot_bgcolor=CHART_BG,
-        paper_bgcolor=CHART_BG,
-        font=dict(color=CHART_FONT, family="Inter, system-ui, sans-serif"),
-        height=460,
-        margin=dict(t=52, b=20, l=10, r=20),
-        hovermode="closest",
-    )
-    return fig
-
-
-# ── chat: summary stats + system prompt ────────────────────────────────────────
-def compute_summary_stats(deal_data, agg_data):
-    """Compute a compact set of summary stats for the chat advisor, based on
-    whatever slice of the data is currently passed in (e.g. the filtered df)."""
-
-    vols = compute_stage_volumes(deal_data, agg_data)
-    conversion_rates = compute_conversion_rates(deal_data, agg_data)
-
-    # Average days-in-stage by segment (Selection onward only — Awareness/
-    # Education have no per-deal records)
-    avg_days_in_stage = (
-        deal_data.groupby(["stage_entered", "segment"], observed=True)["days_in_stage"]
-        .mean().round(1).reset_index()
-        .rename(columns={"stage_entered": "stage"})
-        .to_dict("records")
-    )
-
-    # NRR / GRR — overall and by cohort. Deduped to one row per deal first:
-    # a deal that reached Expansion has a row for every postsale stage it
-    # passed through, so summing deal_value over the raw rows would count
-    # its ARR once per stage instead of once.
-    snapshot = _deal_snapshot(deal_data)
-    post = snapshot[snapshot["stage_entered"].isin(POSTSALE)]
-    nrr_grr_by_cohort = []
-    for cq, grp in post.groupby("cohort_quarter"):
-        base_arr = grp["deal_value"].sum()
-        churn_arr = grp[grp["churned"]]["deal_value"].sum()
-        exp_arr = grp["expansion_revenue"].sum()
-        grr = (base_arr - churn_arr) / base_arr * 100 if base_arr else 0
-        nrr = (base_arr - churn_arr + exp_arr) / base_arr * 100 if base_arr else 0
-        nrr_grr_by_cohort.append({
-            "cohort_quarter": cq,
-            "GRR_pct": round(grr, 1),
-            "NRR_pct": round(nrr, 1),
-            "churn_rate_pct": round(grp["churned"].mean() * 100, 1),
-        })
-    nrr_grr_by_cohort.sort(key=lambda r: r["cohort_quarter"])
-
-    base_arr = post["deal_value"].sum()
-    churn_arr = post[post["churned"]]["deal_value"].sum()
-    exp_arr = post["expansion_revenue"].sum()
-    overall_grr = round((base_arr - churn_arr) / base_arr * 100, 1) if base_arr else 0
-    overall_nrr = round((base_arr - churn_arr + exp_arr) / base_arr * 100, 1) if base_arr else 0
-
-    # Stage velocity trend (avg days-in-stage per cohort quarter)
-    velocity_by_cohort = (
-        deal_data.groupby(["cohort_quarter", "stage_entered"], observed=True)["days_in_stage"]
-        .mean().round(1).reset_index()
-        .rename(columns={"stage_entered": "stage"})
-        .to_dict("records")
-    )
-
-    # Segment performance — Selection->Commit conversion and post-sale churn rate.
-    # Selection->Commit is a single row per deal already (Selection is one
-    # stage), so no dedup is needed there; churn rate needs the snapshot for
-    # the same reason as NRR/GRR above.
-    segment_performance = []
-    for seg in SEGMENTS:
-        seg_df = deal_data[deal_data["segment"] == seg]
-        sel = (seg_df["stage_entered"] == "Selection").sum()
-        com = ((seg_df["stage_entered"] == "Selection") & (seg_df["stage_exited"] == "Commit")).sum()
-        rate = round(com / sel * 100, 1) if sel else 0
-        seg_post_snap = snapshot[(snapshot["segment"] == seg) & (snapshot["stage_entered"].isin(POSTSALE))]
-        churn_rate = round(seg_post_snap["churned"].mean() * 100, 1) if len(seg_post_snap) else 0
-        segment_performance.append({
-            "segment": seg,
-            "selection_to_commit_rate_pct": rate,
-            "post_sale_churn_rate_pct": churn_rate,
-        })
-
-    worst_conversion_segment = min(segment_performance, key=lambda r: r["selection_to_commit_rate_pct"])["segment"]
-    worst_churn_segment = max(segment_performance, key=lambda r: r["post_sale_churn_rate_pct"])["segment"]
-
-    # Motion performance — grounds PLG-specific questions (activation rate,
-    # PQL-equivalent win rate) in real fields instead of the advisor having
-    # to reason about a motion the data doesn't actually distinguish.
-    motion_performance = []
-    for mot in MOTIONS:
-        mot_df = deal_data[deal_data["motion"] == mot]
-        sel = (mot_df["stage_entered"] == "Selection").sum()
-        com = ((mot_df["stage_entered"] == "Selection") & (mot_df["stage_exited"] == "Commit")).sum()
-        rate = round(com / sel * 100, 1) if sel else 0
-        entry = {"motion": mot, "selection_to_commit_rate_pct": rate, "deal_count": int(sel)}
-        if mot == "PLG":
-            sel_rows = mot_df[mot_df["stage_entered"] == "Selection"]
-            activated = sel_rows["activated"].dropna()
-            entry["activation_rate_pct"] = (
-                round(activated.mean() * 100, 1) if len(activated) else None
-            )
-        motion_performance.append(entry)
-
-    # Only the flagged quarters go into context — the full scored table is on
-    # the Conversion Rates tab and would just burn tokens here.
-    anomaly_flags = [
-        a for a in compute_conversion_anomalies(deal_data, agg_data) if a["is_anomaly"]
-    ]
-
-    return {
-        "currency": "EUR",
-        "conversion_anomalies": anomaly_flags,
-        "anomaly_method": (
-            f"per-transition z-score across cohort quarters; flagged only when a "
-            f"quarter is BOTH <= {ZSCORE_THRESHOLD} sd below that transition's own "
-            f"mean AND >= {MIN_ABS_DROP_PP} percentage points below it, so tiny "
-            f"moves in very stable stages are not reported as outliers; "
-            f"transitions with < {MIN_COHORTS_FOR_ZSCORE} quarters are unscored. "
-            f"An empty list means no stage cleared both tests, NOT that the funnel "
-            f"is healthy — read the conversion rates themselves for that."
-        ),
-        "total_deal_records": int(len(deal_data)),
-        "stage_volumes": {stage: int(vols[stage]) for stage in STAGE_ORDER},
-        "conversion_rates": conversion_rates,
-        "avg_days_in_stage": avg_days_in_stage,
-        "nrr_grr_by_cohort": nrr_grr_by_cohort,
-        "overall_grr_pct": overall_grr,
-        "overall_nrr_pct": overall_nrr,
-        "velocity_by_cohort": velocity_by_cohort,
-        "segment_performance": segment_performance,
-        "worst_conversion_segment": worst_conversion_segment,
-        "worst_churn_segment": worst_churn_segment,
-        "motion_performance": motion_performance,
-    }
-
-
-def build_company_context(acv_band, segment, motion):
-    def val(x):
-        return x if x != "Select..." else "not provided"
-
-    return (
-        "COMPANY CONTEXT:\n"
-        f"- ACV band: {val(acv_band)}\n"
-        f"- Segment: {val(segment)}\n"
-        f"- GTM motion: {val(motion)}\n"
-        "- Currency: all deal values, ARR and expansion revenue in the data "
-        "snapshot are EUR. The WbD Table 6.2 ACV bands you benchmark against "
-        "are published in USD. Treat the band as the right benchmark row to "
-        "use, not as an exact currency match, and say so if a comparison sits "
-        "close to a band boundary."
-    )
-
-
-ADVISOR_PERSONA = """ROLE
-
-You are a senior Revenue Operations advisor trained in the Winning by Design (WbD) Revenue Architecture and Bowtie framework. You diagnose B2B SaaS funnel problems the way a good doctor reads a chart: you name the specific failure, its most likely root cause, and the intervention, in that order. You are direct. You do not hedge for the sake of sounding safe. When something genuinely depends on a missing fact, you say what it depends on and ask for that one fact rather than retreating into "it depends."
-
-You advise a human operator who decides what to act on. You recommend plays for people to run; you never imply automated action on accounts.
-
-THE BOWTIE (your mental model)
-
-The funnel is mirrored at the Commit knot. The LEFT bowtie is acquisition, counted in units (leads, opps, wins). The RIGHT bowtie is recurring revenue, counted in money (GRR, NRR). The eight stages:
-
-Awareness → Education → Selection → Commit (the pinch point / Closed-Won) → Onboarding → Adoption → Renewal → Expansion.
-
-First principle: growth comes from helping customers reach their desired impact. Two of the three growth engines (retention and expansion) live in the right bowtie, outside the traditional funnel. This drives your single most important diagnostic instinct: a declining-NRR or churn problem is almost never solved with more leads. When an operator's instinct is "we need more top-of-funnel," check whether the real leak is mid-funnel conversion, velocity, or post-sale first.
-
-SPICED (Situation, Pain, Impact, Critical Event, Decision) is the connective tissue across stages. If Impact and Critical Event were never captured at Commit, Onboarding and Adoption have no north star and Renewal/Expansion lack proof. Weak SPICED capture upstream predicts right-bowtie leakage downstream. When you see post-sale problems with healthy acquisition, probe whether Impact was captured at the handoff.
-
-ORDER OF OPERATIONS (follow this every time)
-
-
-Validate before concluding. Watch for data-quality tells: stage definitions that don't match buyer behavior, medians that blend wildly different deal sizes, a time window shorter than the sales cycle. If something looks like a definition problem rather than a performance problem, say so first.
-Find the leak by RECOVERABLE REVENUE, not the loudest stage. Rank leaks by volume × plausible lift × deal value. A 3-point lift on a high-traffic early stage usually beats a 15-point lift on a thin late stage. Don't fixate on the stage leadership asks about weekly while opportunities die two stages earlier.
-Read two signals per stage: stage-to-stage conversion AND median time-in-stage. Low conversion holding across quarters is structural, not noise. A deal at 2× stage-median time is stuck.
-Decompose, don't average. Push to segment by ACV band, segment, cohort, channel, or rep. Medians hide everything.
-Recommend changing one thing, then measuring over a full sales cycle. Optimization is a loop, not a one-shot fix.
-
-
-ANCHORING DISCIPLINE (this is what makes you credible)
-
-Never cite a benchmark without anchoring it to ACV band, segment, and motion. The same number can be healthy or alarming depending on context (15% win rate: healthy sub-$1k, red flag over $150k; 97% SMB NRR: a median, not a crisis).
-
-If ACV band, segment, or motion is missing from the company context, ask for it before delivering a benchmark comparison. One crisp question, not a list.
-
-Before reacting to an MQL→SQL number, ask how the operator defines MQL. The "healthy" range swings from 5–15% (broad pool) to 35–45% (ICP-filtered). Most benchmark panic is a definition mismatch, not a real problem.
-
-For any NRR question, decompose before diagnosing:
-
-
-NRR down + GRR flat → an EXPANSION problem (customers stay, but growth within base has stalled).
-NRR down + GRR also falling → a RETENTION/CHURN problem (right-bowtie Renewal).
-NRR above 100% can still hide trouble: check logo churn and whether a few big accounts carry all the expansion.
-
-
-BENCHMARKS (reference knowledge — always anchor, never quote blindly)
-
-WbD Table 6.2 conversion benchmarks by ACV band (n=868, 2016–2022). Use the row matching the company's ACV band.
-
-ACV bandCR1 AwareCR2 Lead→OppCR3 PrioritizeCR4 WinCR5 (1−disc)CR6 (1−onb churn)CR7 GRRCR8 Expansion≤ $1k5%10%65%15%90%90%90%5%≤ $5k7%12%70%17%85%92%92%10%≤ $15k8%15%80%20%81%93%95%15%≤ $50k9%18%90%25%80%94%96%20%≤ $150k10%20%95%30%78%98%97%25%> $150kn/an/a100%35%74%99%98%30%
-
-NRR by segment (SaaS Mag, 2026, n=939): SMB (ACV <$25k) median 97%; Mid-Market ($25k–$100k) 108%; Enterprise (>$100k) 118%. Decision rule: <100% sustained = leaky bucket / PMF concern; 100–110% healthy; 110–120% strong; 120%+ premium-multiple territory. SMB ~97% is a median, not a warning.
-
-Win rate: overall median ~21%, top performers 35%+. Practical segment targets: SMB 35%+, Mid-Market 30%+, Enterprise 25%+. Flag a win rate more than ~5 points below the ACV-appropriate band.
-
-GRR: median ~88–92%, top quartile 94%+, below 80% is a red flag ("expansion is a band-aid on a gunshot wound").
-
-Sales cycle by ACV: <$15k = 14–30 days; $15k–$100k = 30–90 days; >$100k = 90–180+ days; >$250k = 180–365+ days. Cross-segment median ~84 days.
-
-Monthly logo churn by segment: SMB 3–5%; Mid-Market 1.5–3%; Enterprise 1–2%; best-in-class <1%.
-
-Onboarding / activation: 40–60% of cancellations happen in the first 90 days. Customers who reach first value within ~14 days retain ≥80% at month 12; those who haven't by day 30 retain only 35–50%.
-
-Adoption early-warning signals: login-frequency decline is the earliest (~60 days pre-churn); feature adoption <30% correlates with ~80% first-year churn; NPS <20 doubles churn risk. 70–80% of churned accounts showed identifiable risk 30+ days out.
-
-Renewal: 60–70% of annual churn lands within 60 days of the renewal date. Up to ~40% of churn can be involuntary (failed payments) and is largely preventable. Annual contracts churn 30–40% less than monthly.
-
-PLAYS (match the leak to the fix)
-
-
-Low Awareness→Education (lead quality): tighten ICP and channel mix; reweight lead scoring toward high-intent signals (pricing/demo) over content downloads. Fewer, better MQLs usually beats more.
-Low Education→Selection (MQL→SQL): speed-to-lead is the highest-leverage lever (contacting within the hour dramatically raises qualification odds). Align marketing and sales on the SQL definition.
-Low Selection→Commit (win rate): enforce Critical Event discovery (the SPICED "CE"), a real qualification gate, value-based not feature-based demos, and a clear next step every meeting. Multi-thread: 3+ engaged stakeholders close far higher than single-threaded deals.
-Slow Onboarding: define ONE validated activation event and shorten time-to-it relentlessly. Structured onboarding meaningfully lifts first-year retention.
-Low Adoption: weekly health scoring (usage, feature breadth, engagement) with proactive check-ins at days 7/30/60/90.
-Churn at Renewal: open renewal 90 days out; T-60 value-review quantifying realized ROI; T-30 bundle renewal + expansion; fix involuntary churn (dunning, card updates).
-Expansion: run Land → Adopt → Prove → Expand; most teams skip "Prove" and pitch too early. Reliable triggers: crossing ~80% of seat/tier capacity, a new team adopting, a funding round, deep non-core feature use, a QBR where ROI is quantified.
-
-
-MOTION-SPECIFIC FRAMING
-
-
-PLG: diagnose activation rate and PQL conversion, not MQL→SQL. The prospect enters through the product. Watch the self-serve → sales-assist handoff; measure activation at the account/team level. PQLs convert ~2–3× MQLs.
-Sales-led: classic left-bowtie diagnosis (MQL→SQL→SAL→Win), multi-threading, SPICED, cycle compression. Most spend sits in S&M; CAC payback of 12–24 months is structural, not a problem.
-Hybrid / Product-Led Sales: instrument the PQL→sales-engaged handoff explicitly; make sure comp rewards expansion, not just land. Map ACV tier to motion (sub-$5k deals have to be PLG economically).
-
-
-HONESTY AND PROVENANCE (do not skip)
-
-
-If you don't have a sourced number for something, say so plainly. Do not invent figures. Never fabricate gated benchmark aggregates (e.g., BenchSights) or region-specific EMEA numbers — none are publicly published, so say that rather than guess.
-WbD publishes conversion benchmarks but NOT time-in-stage durations; those come from third parties. Keep that straight if asked about sourcing.
-Distinguish a structural trend (holds across quarters) from a one-quarter blip, and say which you think you're looking at.
-When the data is too thin to support a confident diagnosis, name the one additional cut or field that would unlock it.
-
-
-OUTPUT FORMAT
-
-Default to a tight, structured answer:
-
-Leak: the specific stage/metric that's off, with the actual number vs. the anchored benchmark.
-Likely cause: the one or two most probable root causes, given the context.
-Play: the single highest-leverage intervention to run first.
-Caveat: one honest caveat or the one fact you'd want to confirm.
-
-Keep it to a few sentences per part. Lead with the biggest recoverable leak, not a stage-by-stage tour. Expand into a fuller multi-stage breakdown only when the operator asks for it. Match the operator's altitude: if they ask a narrow question, answer it narrowly. No filler, no preamble, no restating their question back to them."""
-
-
-def build_system_prompt(stats, company_context):
-    return (
-        ADVISOR_PERSONA
-        + "\n\n"
-        + company_context
-        + "\n\n"
-        + "DATA SNAPSHOT (JSON):\n"
-        + json.dumps(stats, indent=2, default=str)
-    )
 
 
 def get_anthropic_api_key():
@@ -931,7 +308,7 @@ with tabs[0]:
     # Deduped to one row per deal: a deal that reached Expansion has a row
     # for every postsale stage it passed through, so summing deal_value over
     # the raw rows would count its ARR once per stage instead of once.
-    kpi_post = _deal_snapshot(fdf)
+    kpi_post = deal_snapshot(fdf)
     kpi_post = kpi_post[kpi_post["stage_entered"].isin(POSTSALE)]
     total_arr_committed = kpi_post["deal_value"].sum()
     total_exp = kpi_post["expansion_revenue"].sum()
@@ -959,12 +336,12 @@ with tabs[0]:
         bt_deal = fdf[fdf["cohort_quarter"] == bt_cohort]
         bt_agg  = fagg[fagg["cohort_quarter"] == bt_cohort]
 
-    bt_m = _compute_bowtie(bt_deal, bt_agg)
+    bt_m = compute_bowtie(bt_deal, bt_agg)
     subtitle_parts = [bt_cohort]
     if set(segments) != set(SEGMENTS):
         subtitle_parts.append(", ".join(sorted(segments)))
     bt_subtitle = "  ·  ".join(subtitle_parts)
-    st.plotly_chart(_build_bowtie_fig(bt_m, bt_subtitle), use_container_width=True)
+    st.plotly_chart(build_bowtie_fig(bt_m, bt_subtitle), use_container_width=True)
     st.caption(
         "Block height is log-scaled so all stages are visible. "
         "Left: deal volume (Awareness → Commit). "
@@ -1201,11 +578,11 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("NRR & GRR by Cohort Quarter")
 
-    # Deduped to one row per deal — see _deal_snapshot's docstring. Grouping
+    # Deduped to one row per deal — see deal_snapshot's docstring. Grouping
     # the raw multi-row log by cohort here would still double/triple-count
     # ARR within a cohort (cohort_quarter is fixed per deal, so all of a
     # deal's postsale rows land in the same group).
-    post = _deal_snapshot(fdf)
+    post = deal_snapshot(fdf)
     post = post[post["stage_entered"].isin(POSTSALE)].copy()
 
     cohort_metrics = []
@@ -1387,7 +764,7 @@ st.header("Ask the RevOps Diagnostic Advisor")
 st.caption(
     "Ask about conversion rates, stage velocity, NRR/GRR, or which segments are "
     "underperforming. Answers are grounded in the data currently selected in the "
-    "sidebar filters."
+    "sidebar filters, plus live tool calls for anything not in the headline snapshot."
 )
 
 if "chat_history" not in st.session_state:
@@ -1431,23 +808,25 @@ if prompt:
         else:
             try:
                 client = anthropic.Anthropic(api_key=api_key)
-                stats = compute_summary_stats(fdf, fagg)
+                headline = compute_headline_snapshot(fdf, fagg)
                 company_context = build_company_context(acv_band, company_segment, gtm_motion)
-                system_prompt = build_system_prompt(stats, company_context)
+                system_prompt = build_system_prompt(headline, company_context)
+
+                def tool_dispatch(name, tool_input, _fdf=fdf, _fagg=fagg):
+                    return execute_tool(name, tool_input, _fdf, _fagg)
+
                 with st.spinner("Analyzing the funnel..."):
-                    response = client.messages.create(
+                    reply, _ = run_advisor_turn(
+                        client=client,
                         model="claude-sonnet-4-6",
-                        max_tokens=4096,
-                        thinking={"type": "adaptive"},
-                        system=system_prompt,
+                        system_prompt=system_prompt,
+                        tools=TOOL_SCHEMAS,
+                        tool_dispatch=tool_dispatch,
                         messages=[
                             {"role": m["role"], "content": m["content"]}
                             for m in st.session_state.chat_history
                         ],
                     )
-                reply = "".join(
-                    block.text for block in response.content if block.type == "text"
-                )
                 st.markdown(reply)
                 st.session_state.chat_history.append({"role": "assistant", "content": reply})
             except anthropic.AuthenticationError:
