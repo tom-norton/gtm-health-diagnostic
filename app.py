@@ -181,10 +181,21 @@ DEAL_STAGES = [s for s in STAGE_ORDER if s not in AGGREGATE_STAGES]
 SEGMENTS = ["SMB", "Mid-Market", "Enterprise"]
 SEGMENT_COLORS = {"SMB": SMB_COLOR, "Mid-Market": MM_COLOR, "Enterprise": ENT_COLOR}
 
+# The deployed demo runs on a personal Anthropic key, so each browser session
+# gets a fixed question budget. Streamlit session state resets on refresh, which
+# makes this a courtesy limit rather than a security control — it stops a casual
+# loop, not a determined one.
+MAX_ADVISOR_MESSAGES = 12
+
+# Author — surfaced in the sidebar and page footer.
+AUTHOR_NAME = "Tom Norton"
+AUTHOR_LINKEDIN = "https://www.linkedin.com/in/tom-p-norton/"
+AUTHOR_REPO = "https://github.com/tom-norton/gtm-health-diagnostic"
+
 # ── bowtie chart constants ────────────────────────────────────────────────────
 _BT_LEFT   = ["Awareness", "Education", "Selection"]
 _BT_CENTER = "Commit"
-_BT_RIGHT  = ["Onboarding", "Adoption", "Expansion"]
+_BT_RIGHT  = ["Onboarding", "Adoption", "Renewal", "Expansion"]
 _BT_STAGES = _BT_LEFT + [_BT_CENTER] + _BT_RIGHT
 
 _BT_COLORS = {
@@ -194,6 +205,7 @@ _BT_COLORS = {
     "Commit":     "#1a3a3a",   # brand-teal
     "Onboarding": "#1a4a4a",
     "Adoption":   "#1a5f5f",
+    "Renewal":    "#1a6868",
     "Expansion":  "#1a7070",
 }
 _BT_BLK_W = 1.5
@@ -258,6 +270,78 @@ def compute_conversion_rates(deal_data, agg_data):
     return rates
 
 
+# ── anomaly detection ─────────────────────────────────────────────────────────
+# Z-SCORE_THRESHOLD is negative because we only care about conversion falling,
+# not rising. -1.5 is deliberately loose: with 8 cohort quarters a stricter cut
+# almost never fires, and the point is to start a conversation, not to prove
+# significance on n=8.
+ZSCORE_THRESHOLD = -1.5
+MIN_COHORTS_FOR_ZSCORE = 4
+
+# A z-score alone is not enough. Where a transition is very stable across
+# cohorts its standard deviation is tiny, so a 0.2-point move scores past -2
+# sigma while meaning nothing operationally. Requiring a minimum absolute drop
+# as well is the difference between statistical and practical significance —
+# without it this flags noise and the whole panel loses credibility.
+MIN_ABS_DROP_PP = 3.0
+
+
+def compute_conversion_anomalies(deal_data, agg_data, threshold=ZSCORE_THRESHOLD,
+                                 min_abs_drop_pp=MIN_ABS_DROP_PP):
+    """Flag cohort quarters where a stage's conversion rate is both a
+    statistical outlier and a materially large drop.
+
+    A quarter is flagged only when BOTH hold:
+      * its z-score is at or below `threshold`, computed against that
+        transition's own mean across cohorts, and
+      * it sits at least `min_abs_drop_pp` percentage points below that mean.
+
+    The z-score is computed per transition, never across transitions: a 25%
+    Selection->Commit rate and a 94% Commit->Onboarding rate are both healthy
+    in context, so pooling them would flag the wrong stage every time. A
+    transition is only scored when it has at least MIN_COHORTS_FOR_ZSCORE
+    quarters of history and a non-zero standard deviation."""
+
+    cohorts = sorted(set(deal_data["cohort_quarter"]) | set(agg_data["cohort_quarter"]))
+
+    # rate per transition per cohort
+    per_cohort = {}
+    for cq in cohorts:
+        d = deal_data[deal_data["cohort_quarter"] == cq]
+        a = agg_data[agg_data["cohort_quarter"] == cq]
+        for r in compute_conversion_rates(d, a):
+            if r["entered"] == 0:
+                continue
+            per_cohort.setdefault((r["from"], r["to"]), []).append(
+                {"cohort_quarter": cq, "rate_pct": r["rate_pct"], "entered": r["entered"]}
+            )
+
+    rows = []
+    for (a, b), obs in per_cohort.items():
+        if len(obs) < MIN_COHORTS_FOR_ZSCORE:
+            continue
+        series = np.array([o["rate_pct"] for o in obs], dtype=float)
+        mean, std = series.mean(), series.std(ddof=0)
+        if std == 0:
+            continue
+        for o in obs:
+            z = (o["rate_pct"] - mean) / std
+            drop_pp = float(mean) - o["rate_pct"]
+            rows.append({
+                "transition": f"{a} → {b}",
+                "cohort_quarter": o["cohort_quarter"],
+                "rate_pct": o["rate_pct"],
+                "mean_pct": round(float(mean), 1),
+                "drop_pp": round(drop_pp, 1),
+                "z_score": round(float(z), 2),
+                "entered": o["entered"],
+                "is_anomaly": bool(z <= threshold and drop_pp >= min_abs_drop_pp),
+            })
+
+    rows.sort(key=lambda r: r["z_score"])
+    return rows
+
+
 # ── bowtie helpers ────────────────────────────────────────────────────────────
 def _compute_bowtie(deal_data, agg_data):
     """All metrics needed to render the bowtie for the given data slice."""
@@ -266,23 +350,28 @@ def _compute_bowtie(deal_data, agg_data):
     commit_recs = deal_data[deal_data["stage_entered"] == "Commit"]
     avg_val     = commit_recs["deal_value"].mean() if len(commit_recs) else 0.0
 
-    onb_recs  = deal_data[deal_data["stage_entered"] == "Onboarding"]
-    onb_count = len(onb_recs)
-    onb_arr   = onb_count * avg_val
+    # Each post-sale stage is counted from its own rows, so the bowtie agrees
+    # with the Conversion Rates tab. (Previously Adoption was derived from the
+    # Onboarding rows' churn flag, which disagreed with the transition log.)
+    def _stage_count(stage):
+        return int((deal_data["stage_entered"] == stage).sum())
 
-    adp_count = int((onb_recs["churned"] == False).sum())
-    adp_arr   = adp_count * avg_val
+    onb_count = _stage_count("Onboarding")
+    adp_count = _stage_count("Adoption")
+    ren_count = _stage_count("Renewal")
+    exp_count = _stage_count("Expansion")
+
+    onb_arr = onb_count * avg_val
+    adp_arr = adp_count * avg_val
+    ren_arr = ren_count * avg_val
 
     total_exp = float(deal_data["expansion_revenue"].sum())
-    exp_arr   = adp_arr + total_exp
+    exp_arr   = exp_count * avg_val + total_exp
     nrr       = round(exp_arr / onb_arr * 100, 1) if onb_arr else 0.0
 
-    PAIRS = [
-        ("Awareness", "Education"), ("Education", "Selection"),
-        ("Selection", "Commit"),    ("Commit",    "Onboarding"),
-    ]
+    # Every consecutive transition uses the same exits/entries model.
     rates = {}
-    for a, b in PAIRS:
+    for a, b in zip(_BT_STAGES, _BT_STAGES[1:]):
         if a in AGGREGATE_STAGES:
             sub     = agg_data[agg_data["stage_entered"] == a]
             entered = int(sub["count_entered"].sum())
@@ -295,16 +384,13 @@ def _compute_bowtie(deal_data, agg_data):
             )
         rates[(a, b)] = round(exited / entered * 100, 1) if entered else 0.0
 
-    rates[("Onboarding", "Adoption")] = (
-        round(adp_count / onb_count * 100, 1) if onb_count else 0.0
-    )
-    rates[("Adoption", "Expansion")]  = nrr
-
     return dict(
         vols=vols, avg_val=avg_val,
         commit_arr=vols.get("Commit", 0) * avg_val,
         onb_count=onb_count, onb_arr=onb_arr,
         adp_count=adp_count, adp_arr=adp_arr,
+        ren_count=ren_count, ren_arr=ren_arr,
+        exp_count=exp_count,
         total_exp=total_exp, exp_arr=exp_arr, nrr=nrr,
         rates=rates,
     )
@@ -328,6 +414,7 @@ def _build_bowtie_fig(m, subtitle="All Cohorts"):
         "Commit":     m["vols"].get("Commit", 0),
         "Onboarding": m["onb_count"],
         "Adoption":   m["adp_count"],
+        "Renewal":    m["ren_count"],
         "Expansion":  int(m["exp_arr"] / avg) if avg else 0,
     }
     H = {s: _log_h(eff.get(s, 0), ref) for s in _BT_STAGES}
@@ -336,11 +423,7 @@ def _build_bowtie_fig(m, subtitle="All Cohorts"):
     for s in _BT_STAGES:
         X[s] = x; x += _BT_BLK_W + _BT_GAP
 
-    RATE_PAIRS = [
-        ("Awareness", "Education"), ("Education", "Selection"),
-        ("Selection", "Commit"),    ("Commit",    "Onboarding"),
-        ("Onboarding", "Adoption"), ("Adoption",  "Expansion"),
-    ]
+    RATE_PAIRS = list(zip(_BT_STAGES, _BT_STAGES[1:]))
 
     fig = go.Figure()
 
@@ -364,26 +447,27 @@ def _build_bowtie_fig(m, subtitle="All Cohorts"):
         if s in _BT_LEFT:
             htxt = f"<b>{s}</b><br>Deals: {v:,}"
         elif s == _BT_CENTER:
-            htxt = f"<b>Commit</b><br>Deals: {v:,}<br>ARR: ${m['commit_arr']:,.0f}"
+            htxt = f"<b>Commit</b><br>Deals: {v:,}<br>ARR: €{m['commit_arr']:,.0f}"
         elif s == "Onboarding":
-            htxt = f"<b>Onboarding</b><br>Deals: {m['onb_count']:,}<br>ARR: ${m['onb_arr']:,.0f}"
+            htxt = f"<b>Onboarding</b><br>Deals: {m['onb_count']:,}<br>ARR: €{m['onb_arr']:,.0f}"
         elif s == "Adoption":
-            htxt = (f"<b>Adoption (GRR)</b><br>Retained: {m['adp_count']:,}"
-                    f"<br>ARR: ${m['adp_arr']:,.0f}")
+            htxt = (f"<b>Adoption</b><br>Deals: {m['adp_count']:,}"
+                    f"<br>ARR: €{m['adp_arr']:,.0f}")
+        elif s == "Renewal":
+            htxt = (f"<b>Renewal</b><br>Deals: {m['ren_count']:,}"
+                    f"<br>ARR: €{m['ren_arr']:,.0f}")
         else:
-            htxt = (f"<b>Expansion (NRR)</b><br>ARR: ${m['exp_arr']:,.0f}"
-                    f"<br>NRR: {m['nrr']:.1f}%<br>Expansion rev: ${m['total_exp']:,.0f}")
+            htxt = (f"<b>Expansion (NRR)</b><br>ARR: €{m['exp_arr']:,.0f}"
+                    f"<br>NRR: {m['nrr']:.1f}%<br>Expansion rev: €{m['total_exp']:,.0f}")
 
         if idx > 0:
             r_in = m["rates"].get((_BT_STAGES[idx - 1], s))
             if r_in is not None:
-                sfx = "% NRR" if s == "Expansion" else "%"
-                htxt += f"<br>Conv in: {r_in:.1f}{sfx}"
+                htxt += f"<br>Conv in: {r_in:.1f}%"
         if idx < len(_BT_STAGES) - 1:
             r_out = m["rates"].get((s, _BT_STAGES[idx + 1]))
             if r_out is not None:
-                sfx = "% NRR" if _BT_STAGES[idx + 1] == "Expansion" else "%"
-                htxt += f"<br>Conv out: {r_out:.1f}{sfx}"
+                htxt += f"<br>Conv out: {r_out:.1f}%"
 
         fig.add_trace(go.Scatter(
             x=[x0, x1, x1, x0, x0], y=[h, h, -h, -h, h],
@@ -397,13 +481,15 @@ def _build_bowtie_fig(m, subtitle="All Cohorts"):
         if s in _BT_LEFT:
             lbl = f"<b>{s}</b><br>{v:,} deals"
         elif s == _BT_CENTER:
-            lbl = f"<b>Commit</b><br>{v:,} deals<br>${m['commit_arr']/1e6:.1f}M ARR"
+            lbl = f"<b>Commit</b><br>{v:,} deals<br>€{m['commit_arr']/1e6:.1f}M ARR"
         elif s == "Onboarding":
-            lbl = f"<b>Onboarding</b><br>${m['onb_arr']/1e6:.1f}M ARR"
+            lbl = f"<b>Onboarding</b><br>€{m['onb_arr']/1e6:.1f}M ARR"
         elif s == "Adoption":
-            lbl = f"<b>Adoption</b><br>${m['adp_arr']/1e6:.1f}M ARR"
+            lbl = f"<b>Adoption</b><br>€{m['adp_arr']/1e6:.1f}M ARR"
+        elif s == "Renewal":
+            lbl = f"<b>Renewal</b><br>€{m['ren_arr']/1e6:.1f}M ARR"
         else:
-            lbl = f"<b>Expansion</b><br>${m['exp_arr']/1e6:.1f}M ARR (NRR)"
+            lbl = f"<b>Expansion</b><br>€{m['exp_arr']/1e6:.1f}M ARR (NRR)"
 
         fsize = 9 if h < 0.30 else 10 if h < 0.55 else 11
         fig.add_annotation(
@@ -416,7 +502,7 @@ def _build_bowtie_fig(m, subtitle="All Cohorts"):
         xm    = (X[a] + _BT_BLK_W + X[b]) / 2
         rate  = m["rates"].get((a, b), 0.0)
         y_lbl = -(min(H[a], H[b]) + 0.09)
-        label = f"{rate:.1f}% NRR" if b == "Expansion" else f"{rate:.1f}%"
+        label = f"{rate:.1f}%"
         fig.add_annotation(
             x=xm, y=y_lbl, text=label, showarrow=False,
             font=dict(color=_BT_MUTED, size=9), align="center",
@@ -525,7 +611,24 @@ def compute_summary_stats(deal_data, agg_data):
     worst_conversion_segment = min(segment_performance, key=lambda r: r["selection_to_commit_rate_pct"])["segment"]
     worst_churn_segment = max(segment_performance, key=lambda r: r["post_sale_churn_rate_pct"])["segment"]
 
+    # Only the flagged quarters go into context — the full scored table is on
+    # the Conversion Rates tab and would just burn tokens here.
+    anomaly_flags = [
+        a for a in compute_conversion_anomalies(deal_data, agg_data) if a["is_anomaly"]
+    ]
+
     return {
+        "currency": "EUR",
+        "conversion_anomalies": anomaly_flags,
+        "anomaly_method": (
+            f"per-transition z-score across cohort quarters; flagged only when a "
+            f"quarter is BOTH <= {ZSCORE_THRESHOLD} sd below that transition's own "
+            f"mean AND >= {MIN_ABS_DROP_PP} percentage points below it, so tiny "
+            f"moves in very stable stages are not reported as outliers; "
+            f"transitions with < {MIN_COHORTS_FOR_ZSCORE} quarters are unscored. "
+            f"An empty list means no stage cleared both tests, NOT that the funnel "
+            f"is healthy — read the conversion rates themselves for that."
+        ),
         "total_deal_records": int(len(deal_data)),
         "stage_volumes": {stage: int(vols[stage]) for stage in STAGE_ORDER},
         "conversion_rates": conversion_rates,
@@ -548,7 +651,12 @@ def build_company_context(acv_band, segment, motion):
         "COMPANY CONTEXT:\n"
         f"- ACV band: {val(acv_band)}\n"
         f"- Segment: {val(segment)}\n"
-        f"- GTM motion: {val(motion)}"
+        f"- GTM motion: {val(motion)}\n"
+        "- Currency: all deal values, ARR and expansion revenue in the data "
+        "snapshot are EUR. The WbD Table 6.2 ACV bands you benchmark against "
+        "are published in USD. Treat the band as the right benchmark row to "
+        "use, not as an exact currency match, and say so if a comparison sits "
+        "close to a band boundary."
     )
 
 
@@ -679,8 +787,11 @@ def get_anthropic_api_key():
 st.sidebar.header("Company Profile")
 st.sidebar.caption("Used by the diagnostic advisor to pick the right benchmarks.")
 
+# The bands are the published Winning by Design Table 6.2 rows, which are
+# denominated in USD. The dataset itself is in EUR — the advisor is told about
+# the mismatch rather than us silently converting a sourced benchmark.
 acv_band = st.sidebar.selectbox(
-    "ACV band",
+    "ACV band (WbD benchmark row, USD)",
     options=["Select...", "≤ $1k", "≤ $5k", "≤ $15k", "≤ $50k", "≤ $150k", "> $150k"],
 )
 company_segment = st.sidebar.selectbox(
@@ -723,6 +834,12 @@ fagg = agg_df[
 
 st.sidebar.markdown("---")
 st.sidebar.metric("Filtered Deal Records", f"{len(fdf):,}")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"Built by **{AUTHOR_NAME}**  \n"
+    f"[LinkedIn]({AUTHOR_LINKEDIN}) · [Source]({AUTHOR_REPO})"
+)
 
 # ── header ────────────────────────────────────────────────────────────────────
 st.title("GTM Health Diagnostic")
@@ -787,9 +904,11 @@ with tabs[0]:
     st.plotly_chart(_build_bowtie_fig(bt_m, bt_subtitle), use_container_width=True)
     st.caption(
         "Block height is log-scaled so all stages are visible. "
-        "Left: deal volume (Awareness -> Commit). "
-        "Right: ARR -- Onboarding (committed), Adoption (GRR after churn), "
-        "Expansion (NRR including expansion revenue)."
+        "Left: deal volume (Awareness → Commit). "
+        "Right: ARR across Onboarding, Adoption, Renewal and Expansion, with "
+        "Expansion including expansion revenue (NRR). Every percentage is a "
+        "stage-to-stage conversion rate on the same exits ÷ entries basis as "
+        "the Conversion Rates tab."
     )
 
     st.markdown("#### Top-of-Funnel Volume by Segment (Awareness → Selection)")
@@ -832,7 +951,7 @@ with tabs[0]:
         arr_seg, x="stage_entered", y="arr_m", color="segment",
         color_discrete_map=SEGMENT_COLORS,
         category_orders={"stage_entered": _commit_plus},
-        labels={"arr_m": "ARR ($M)", "stage_entered": "Stage"},
+        labels={"arr_m": "ARR (€M)", "stage_entered": "Stage"},
     )
     fig_arr.update_layout(
         plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
@@ -883,6 +1002,55 @@ with tabs[1]:
         "Rate": [f"{r['rate_pct']:.1f}%" for r in rates],
     })
     st.dataframe(conv_df, use_container_width=True, hide_index=True)
+
+    # ── anomaly flags ────────────────────────────────────────────────────────
+    st.markdown("#### Conversion Anomalies")
+    st.caption(
+        f"A quarter is flagged only when it clears two tests: at least "
+        f"{abs(ZSCORE_THRESHOLD)}σ below that transition's own mean across cohorts, "
+        f"**and** at least {MIN_ABS_DROP_PP:.0f} percentage points below it. The "
+        f"second test matters — where a stage is very stable its standard deviation "
+        f"is tiny, so a z-score alone flags fractions of a point as outliers. "
+        f"Scoring is per transition, so stages with different healthy ranges aren't "
+        f"compared against each other, and transitions with fewer than "
+        f"{MIN_COHORTS_FOR_ZSCORE} quarters of history are left unscored."
+    )
+
+    anomalies = compute_conversion_anomalies(fdf, fagg)
+    flagged = [a for a in anomalies if a["is_anomaly"]]
+
+    if not anomalies:
+        st.info(
+            "Not enough cohort history in the current filter to score anomalies. "
+            f"Each transition needs at least {MIN_COHORTS_FOR_ZSCORE} quarters."
+        )
+    elif not flagged:
+        w = anomalies[0]
+        st.success(
+            f"No stage cleared both tests in any quarter. The largest single drop "
+            f"was {w['transition']} in {w['cohort_quarter']}: {w['rate_pct']:.1f}% "
+            f"against a {w['mean_pct']:.1f}% mean — {w['drop_pp']:.1f} points, "
+            f"{w['z_score']:+.2f}σ. Statistically an outlier, but too small a move "
+            f"to act on."
+        )
+    else:
+        for a in flagged:
+            st.error(
+                f"**{a['transition']}** — {a['cohort_quarter']} converted at "
+                f"**{a['rate_pct']:.1f}%** against a {a['mean_pct']:.1f}% mean: "
+                f"down {a['drop_pp']:.1f} points ({a['z_score']:+.2f}σ) on "
+                f"{a['entered']:,} deals entered."
+            )
+
+    if anomalies:
+        anom_df = pd.DataFrame(anomalies)[
+            ["transition", "cohort_quarter", "rate_pct", "mean_pct", "drop_pp",
+             "z_score", "entered", "is_anomaly"]
+        ]
+        anom_df.columns = ["Transition", "Cohort", "Rate (%)", "Mean (%)",
+                           "Drop (pp)", "Z-score", "Entered", "Flagged"]
+        with st.expander("All scored quarters (largest drop first)"):
+            st.dataframe(anom_df, use_container_width=True, hide_index=True)
 
     # Conversion by segment (Selection -> Commit is the first transition
     # where deal-level segment data is available)
@@ -1031,7 +1199,7 @@ with tabs[3]:
     ))
     fig_wf.update_layout(
         barmode="relative",
-        yaxis_title="ARR ($M)",
+        yaxis_title="ARR (€M)",
         xaxis_tickangle=-30,
         plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
         height=350, margin=dict(t=10, b=80),
@@ -1161,7 +1329,24 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("e.g. Where are deals getting stuck, and what should we fix first?"):
+asked = sum(1 for m in st.session_state.chat_history if m["role"] == "user")
+remaining = MAX_ADVISOR_MESSAGES - asked
+
+if remaining <= 0:
+    st.info(
+        f"You've used all {MAX_ADVISOR_MESSAGES} advisor questions for this session. "
+        "This is a personal-portfolio demo running on my own API key, so each "
+        "visitor gets a fixed budget. Refresh the page to start a new session, or "
+        "run it locally with your own key — see the README."
+    )
+    st.chat_input("Session question limit reached", disabled=True)
+    prompt = None
+else:
+    if remaining <= 3:
+        st.caption(f"{remaining} of {MAX_ADVISOR_MESSAGES} questions left this session.")
+    prompt = st.chat_input("e.g. Where are deals getting stuck, and what should we fix first?")
+
+if prompt:
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -1203,3 +1388,13 @@ if prompt := st.chat_input("e.g. Where are deals getting stuck, and what should 
                 st.error("Rate limit reached — please wait a moment and try again.")
             except anthropic.APIStatusError as e:
                 st.error(f"Anthropic API error: {e}")
+
+
+# ── footer ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption(
+    f"Built by [{AUTHOR_NAME}]({AUTHOR_LINKEDIN}) · "
+    f"[Source and methodology notes]({AUTHOR_REPO}) · "
+    "Figures are EUR. Dataset is synthetic; Winning by Design benchmarks are "
+    "sourced and published in USD."
+)
