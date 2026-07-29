@@ -181,6 +181,10 @@ DEAL_STAGES = [s for s in STAGE_ORDER if s not in AGGREGATE_STAGES]
 SEGMENTS = ["SMB", "Mid-Market", "Enterprise"]
 SEGMENT_COLORS = {"SMB": SMB_COLOR, "Mid-Market": MM_COLOR, "Enterprise": ENT_COLOR}
 
+# GTM motion is a deal-level dimension from Selection onward; Awareness/
+# Education aggregate rows are motion-agnostic (shared top-of-funnel pool).
+MOTIONS = ["Sales-led", "PLG"]
+
 # The deployed demo runs on a personal Anthropic key, so each browser session
 # gets a fixed question budget. Streamlit session state resets on refresh, which
 # makes this a courtesy limit rather than a security control — it stops a casual
@@ -214,6 +218,15 @@ _BT_MAX_H = 1.0
 _BT_MUTED = "#9a9a9a"   # muted-soft
 
 # ── data ─────────────────────────────────────────────────────────────────────
+# `deal` is a true transition log: a deal that reaches Expansion contributes
+# one row per stage occupied (Selection, Commit, Onboarding, Adoption,
+# Renewal, Expansion), all sharing one deal_id. Counting rows per stage is
+# therefore safe everywhere (each deal has exactly one row per stage it
+# passed through), but SUMMING deal_value/expansion_revenue across multiple
+# postsale rows for the same deal overcounts its ARR once per stage it
+# reached. `_deal_snapshot()` below recovers one row per deal -- its
+# terminal stage, win or churn -- for exactly that kind of ARR/retention
+# math. See data/generate.py for how the CSV is produced.
 @st.cache_data
 def load_data():
     raw = pd.read_csv("bowtie_data.csv")
@@ -232,9 +245,22 @@ def load_data():
     deal["stage_exited"]      = deal["stage_exited"].fillna("")
     deal["expansion_revenue"] = pd.to_numeric(deal["expansion_revenue"], errors="coerce").fillna(0)
     deal["stage_entered"]     = pd.Categorical(deal["stage_entered"], categories=STAGE_ORDER, ordered=True)
+    deal["activated"] = deal["activated"].map({"True": True, "False": False, True: True, False: False})
     deal = deal.drop(columns=["record_type", "count_entered", "count_exited"])
 
     return agg, deal
+
+
+def _deal_snapshot(deal_data):
+    """One row per distinct deal_id: its terminal stage, whether that means
+    reaching Expansion or churning earlier. Every deal's chain of per-stage
+    rows has exactly one row with an empty stage_exited -- the stage where
+    its journey ended -- which is what this filters on. Use this, never the
+    full per-stage log, for ARR / NRR / GRR / churn-rate math: summing
+    deal_value across a deal's multiple stage rows counts its ARR once per
+    stage it reached rather than once."""
+    return deal_data[deal_data["stage_exited"] == ""]
+
 
 agg_df, df = load_data()
 
@@ -562,8 +588,12 @@ def compute_summary_stats(deal_data, agg_data):
         .to_dict("records")
     )
 
-    # NRR / GRR — overall and by cohort
-    post = deal_data[deal_data["stage_entered"].isin(POSTSALE)]
+    # NRR / GRR — overall and by cohort. Deduped to one row per deal first:
+    # a deal that reached Expansion has a row for every postsale stage it
+    # passed through, so summing deal_value over the raw rows would count
+    # its ARR once per stage instead of once.
+    snapshot = _deal_snapshot(deal_data)
+    post = snapshot[snapshot["stage_entered"].isin(POSTSALE)]
     nrr_grr_by_cohort = []
     for cq, grp in post.groupby("cohort_quarter"):
         base_arr = grp["deal_value"].sum()
@@ -593,15 +623,18 @@ def compute_summary_stats(deal_data, agg_data):
         .to_dict("records")
     )
 
-    # Segment performance — Selection->Commit conversion and post-sale churn rate
+    # Segment performance — Selection->Commit conversion and post-sale churn rate.
+    # Selection->Commit is a single row per deal already (Selection is one
+    # stage), so no dedup is needed there; churn rate needs the snapshot for
+    # the same reason as NRR/GRR above.
     segment_performance = []
     for seg in SEGMENTS:
         seg_df = deal_data[deal_data["segment"] == seg]
         sel = (seg_df["stage_entered"] == "Selection").sum()
         com = ((seg_df["stage_entered"] == "Selection") & (seg_df["stage_exited"] == "Commit")).sum()
         rate = round(com / sel * 100, 1) if sel else 0
-        seg_post = seg_df[seg_df["stage_entered"].isin(POSTSALE)]
-        churn_rate = round(seg_post["churned"].mean() * 100, 1) if len(seg_post) else 0
+        seg_post_snap = snapshot[(snapshot["segment"] == seg) & (snapshot["stage_entered"].isin(POSTSALE))]
+        churn_rate = round(seg_post_snap["churned"].mean() * 100, 1) if len(seg_post_snap) else 0
         segment_performance.append({
             "segment": seg,
             "selection_to_commit_rate_pct": rate,
@@ -610,6 +643,24 @@ def compute_summary_stats(deal_data, agg_data):
 
     worst_conversion_segment = min(segment_performance, key=lambda r: r["selection_to_commit_rate_pct"])["segment"]
     worst_churn_segment = max(segment_performance, key=lambda r: r["post_sale_churn_rate_pct"])["segment"]
+
+    # Motion performance — grounds PLG-specific questions (activation rate,
+    # PQL-equivalent win rate) in real fields instead of the advisor having
+    # to reason about a motion the data doesn't actually distinguish.
+    motion_performance = []
+    for mot in MOTIONS:
+        mot_df = deal_data[deal_data["motion"] == mot]
+        sel = (mot_df["stage_entered"] == "Selection").sum()
+        com = ((mot_df["stage_entered"] == "Selection") & (mot_df["stage_exited"] == "Commit")).sum()
+        rate = round(com / sel * 100, 1) if sel else 0
+        entry = {"motion": mot, "selection_to_commit_rate_pct": rate, "deal_count": int(sel)}
+        if mot == "PLG":
+            sel_rows = mot_df[mot_df["stage_entered"] == "Selection"]
+            activated = sel_rows["activated"].dropna()
+            entry["activation_rate_pct"] = (
+                round(activated.mean() * 100, 1) if len(activated) else None
+            )
+        motion_performance.append(entry)
 
     # Only the flagged quarters go into context — the full scored table is on
     # the Conversion Rates tab and would just burn tokens here.
@@ -640,6 +691,7 @@ def compute_summary_stats(deal_data, agg_data):
         "segment_performance": segment_performance,
         "worst_conversion_segment": worst_conversion_segment,
         "worst_churn_segment": worst_churn_segment,
+        "motion_performance": motion_performance,
     }
 
 
@@ -811,6 +863,9 @@ st.sidebar.header("Filters")
 segments = st.sidebar.multiselect(
     "Segment", options=SEGMENTS, default=SEGMENTS,
 )
+motions = st.sidebar.multiselect(
+    "Motion", options=MOTIONS, default=MOTIONS,
+)
 cohorts = sorted(set(df["cohort_quarter"]) | set(agg_df["cohort_quarter"]))
 selected_cohorts = st.sidebar.multiselect(
     "Cohort Quarter", options=cohorts, default=cohorts,
@@ -821,19 +876,21 @@ reps = st.sidebar.multiselect(
 
 fdf = df[
     df["segment"].isin(segments) &
+    df["motion"].isin(motions) &
     df["cohort_quarter"].isin(selected_cohorts) &
     df["rep_name"].isin(reps)
 ].copy()
 
-# Awareness/Education aggregate rows have no segment or rep, so only the
-# cohort filter applies to them.
+# Awareness/Education aggregate rows have no segment, motion or rep, so only
+# the cohort + segment filters apply to them (motion doesn't split top-of-
+# funnel volume — see MOTIONS comment above).
 fagg = agg_df[
     agg_df["cohort_quarter"].isin(selected_cohorts) &
     agg_df["segment"].isin(segments)
 ].copy()
 
 st.sidebar.markdown("---")
-st.sidebar.metric("Filtered Deal Records", f"{len(fdf):,}")
+st.sidebar.metric("Filtered Distinct Deals", f"{fdf['deal_id'].nunique():,}")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
@@ -844,8 +901,9 @@ st.sidebar.markdown(
 # ── header ────────────────────────────────────────────────────────────────────
 st.title("GTM Health Diagnostic")
 st.markdown(
-    f"Showing **{len(fdf):,}** of {len(df):,} deal records (Selection → Expansion) · "
-    f"{len(segments)} segment(s) · {len(selected_cohorts)} cohort(s)"
+    f"Showing **{fdf['deal_id'].nunique():,}** of {df['deal_id'].nunique():,} distinct deals "
+    f"(Selection → Expansion) · {len(segments)} segment(s) · {len(motions)} motion(s) · "
+    f"{len(selected_cohorts)} cohort(s)"
 )
 
 tabs = st.tabs([
@@ -870,9 +928,14 @@ with tabs[0]:
     committed = vols["Commit"]
     overall_conv = (committed / awareness * 100) if awareness else 0
 
-    total_arr_committed = fdf[fdf["stage_entered"].isin(POSTSALE)]["deal_value"].sum()
-    total_exp = fdf["expansion_revenue"].sum()
-    churn_arr = fdf[fdf["churned"]]["deal_value"].sum()
+    # Deduped to one row per deal: a deal that reached Expansion has a row
+    # for every postsale stage it passed through, so summing deal_value over
+    # the raw rows would count its ARR once per stage instead of once.
+    kpi_post = _deal_snapshot(fdf)
+    kpi_post = kpi_post[kpi_post["stage_entered"].isin(POSTSALE)]
+    total_arr_committed = kpi_post["deal_value"].sum()
+    total_exp = kpi_post["expansion_revenue"].sum()
+    churn_arr = kpi_post[kpi_post["churned"]]["deal_value"].sum()
     gross_retention = 1 - churn_arr / total_arr_committed if total_arr_committed else 0
     nrr = (total_arr_committed + total_exp - churn_arr) / total_arr_committed if total_arr_committed else 0
 
@@ -1138,7 +1201,12 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("NRR & GRR by Cohort Quarter")
 
-    post = fdf[fdf["stage_entered"].isin(POSTSALE)].copy()
+    # Deduped to one row per deal — see _deal_snapshot's docstring. Grouping
+    # the raw multi-row log by cohort here would still double/triple-count
+    # ARR within a cohort (cohort_quarter is fixed per deal, so all of a
+    # deal's postsale rows land in the same group).
+    post = _deal_snapshot(fdf)
+    post = post[post["stage_entered"].isin(POSTSALE)].copy()
 
     cohort_metrics = []
     for cq, grp in post.groupby("cohort_quarter"):
