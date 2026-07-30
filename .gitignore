@@ -8,3 +8,17 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Personal explainers / interview prep / outreach drafts -- not for the
+# public repo. Keep these locally only.
+docs/01-architecture.md
+docs/02-data-model.md
+docs/03-metrics.md
+docs/04-charts.md
+docs/05-advisor-prompt.md
+docs/06-tool-calling-and-mcp.md
+docs/07-hubspot.md
+docs/08-glossary.md
+docs/hubspot-setup.md
+docs/loom-script.md
+docs/linkedin-post.md

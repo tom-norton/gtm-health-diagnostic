@@ -47,8 +47,6 @@ mcp_server/    Standalone MCP server exposing the same three tools to
 tests/         pytest over metrics/, advisor/tools.py and
                data/hubspot_source.py, run in CI on every push
                (.github/workflows/tests.yml).
-docs/          Whole-project explainers (01-08), hubspot-setup.md, and the
-               Loom script / LinkedIn draft. See "Explainers" below.
 app.py         Streamlit UI only — five tabs, sidebar filters, the Demo/
                Live data-source toggle, the chat surface. Imports
                everything else; defines nothing itself beyond page config,
@@ -139,7 +137,7 @@ The generator also injects one deliberate, real anomaly — an Enterprise/Sales-
 
 ## HubSpot connector
 
-A sidebar toggle switches the whole app between the synthetic dataset and a real HubSpot portal's Deals, via `data/hubspot_source.py`. Setup is in **[docs/hubspot-setup.md](docs/hubspot-setup.md)** — a click-by-click guide, including the exact private-app scopes and the custom deal properties the connector expects.
+A sidebar toggle switches the whole app between the synthetic dataset and a real HubSpot portal's Deals, via `data/hubspot_source.py`. It reads a custom `bowtie_stage` deal property (plus a handful of supporting custom properties) through a HubSpot private app scoped to `crm.objects.deals.read` and `crm.objects.owners.read` — see `data/hubspot_source.py` for the full property list and scopes.
 
 The connector maps deals onto the bowtie via one custom dropdown property, `bowtie_stage` (Selection → Expansion — the six stages a HubSpot deal can meaningfully represent; Awareness/Education stay synthetic-only, since they aren't deals). The interesting part is *how* it reconstructs a transition log rather than a single current-stage snapshot: it calls the Deals API with `propertiesWithHistory=bowtie_stage`, which returns every value that property has ever held, each timestamped. Sorting that list and turning each consecutive pair into a row — stage entered, stage exited into, days between the two timestamps — produces exactly the same multi-row-per-deal shape `data/generate.py` produces. Nothing downstream needed to change: `metrics/`, `advisor/` and `charts/` don't know or care whether a row came from a CSV or a live API call. That was the design goal from the start — a data source swap, not a rewrite.
 
@@ -155,7 +153,7 @@ Naming what was left out, and why, matters as much as what shipped.
 
 **No claim that this is an EU AI Act high-risk system, and no design that would make it one.** Revenue funnel diagnostics is not a listed high-risk use case. It would move toward one if it were extended to score individuals in an employment context, so that specific extension is off the roadmap rather than merely unimplemented. Transparency obligations still apply: the advisor is clearly labelled as AI-generated output and every number it cites is visible in the dashboard above it.
 
-**No data leaves the session.** The demo runs on synthetic data. Nothing is stored, no chat history is persisted server-side, and there is no analytics or tracking layer. The HubSpot connector reads only — it has no write scope and cannot modify a portal — and its access token lives in local secrets, never in the repository. See [docs/hubspot-setup.md](docs/hubspot-setup.md) for why it's meant to run against a developer sandbox rather than production customer data.
+**No data leaves the session.** The demo runs on synthetic data. Nothing is stored, no chat history is persisted server-side, and there is no analytics or tracking layer. The HubSpot connector reads only — it has no write scope and cannot modify a portal — and its access token lives in local secrets, never in the repository. It's meant to run against a developer sandbox with test deals, not a production portal with real customer data.
 
 **No unbounded API spend.** The public demo caps advisor questions per browser session, because it runs on a personal API key. It is a courtesy limit, not a security control.
 
@@ -174,7 +172,7 @@ Naming what was left out, and why, matters as much as what shipped.
 pip install -r requirements.txt
 ```
 
-Add your Anthropic API key — and, optionally, a HubSpot private-app access token if you want Live mode (see [docs/hubspot-setup.md](docs/hubspot-setup.md)) — to `.streamlit/secrets.toml`:
+Add your Anthropic API key — and, optionally, a HubSpot private-app access token if you want Live mode — to `.streamlit/secrets.toml`:
 
 ```toml
 ANTHROPIC_API_KEY = "sk-ant-..."
@@ -204,21 +202,6 @@ pip install pytest
 pytest tests/ -v
 ```
 
-## Explainers
-
-This README covers the what and the headline why. For the whole project walked through in detail — written to be read aloud in an interview, not just skimmed — see `docs/`:
-
-1. [Architecture](docs/01-architecture.md) — how the packages fit together, and why the boundaries are drawn where they are
-2. [Data model](docs/02-data-model.md) — the transition-log schema, the snapshot problem, entity-stable deal IDs
-3. [Metrics](docs/03-metrics.md) — every calculation, module by module: conversion rates, the bowtie's own aggregation, the two-part anomaly test
-4. [Charts](docs/04-charts.md) — why the bowtie diagram is hand-drawn and log-scaled, and why the simpler charts aren't
-5. [The advisor prompt, clause by clause](docs/05-advisor-prompt.md) — what each section of the persona is for and what breaks without it
-6. [Tool calling and MCP, in plain English](docs/06-tool-calling-and-mcp.md) — workflow vs. agent, what happens on the wire, and authoring an MCP server rather than just consuming one
-7. [HubSpot, and why it's built the way it is](docs/07-hubspot.md) — the design decisions behind the connector (setup steps are in [hubspot-setup.md](docs/hubspot-setup.md))
-8. [Glossary](docs/08-glossary.md) — every term this project uses precisely, in one place
-
-Plus [a Loom walkthrough script](docs/loom-script.md) and [a LinkedIn case-study draft](docs/linkedin-post.md).
-
 ## Roadmap
 
 **Done:**
@@ -226,9 +209,6 @@ Plus [a Loom walkthrough script](docs/loom-script.md) and [a LinkedIn case-study
 - The advisor moved from a single context-stuffed prompt to a real tool-use loop over `get_stage_health`, `diagnose_conversion_drop` and `recommend_play`, and those same tools now run as a standalone MCP server for Claude Desktop — see [Tool calling and MCP](#tool-calling-and-mcp).
 - The codebase split into `metrics/`, `data/`, `advisor/`, `charts/` and `mcp_server/` packages with a pytest suite in CI, so the dashboard, the chat advisor, and the MCP server share one tested source of truth instead of three copies of the same arithmetic.
 - A HubSpot connector (`data/hubspot_source.py`) — a Demo/Live toggle pulling real deals from a developer sandbox via the Deals API, mapping HubSpot deals onto bowtie stages through a custom property, with property-history reconstruction so the same conversion, velocity and retention math runs unmodified — see [HubSpot connector](#hubspot-connector).
-- Whole-project written explainers (`docs/01`–`08`), a Loom walkthrough script, and a LinkedIn case-study draft — see [Explainers](#explainers).
-
-**Next:** recording the actual Loom video and posting the LinkedIn writeup — both are ready to go in `docs/`, the rest is just pressing record and publish.
 
 ---
 
