@@ -26,6 +26,7 @@ from charts import (
     build_bowtie_fig,
 )
 from data.loader import load_data as _load_data
+from data.hubspot_source import HubSpotConfigError, fetch_hubspot_data
 from metrics import (
     DEAL_STAGES,
     MIN_ABS_DROP_PP,
@@ -200,16 +201,51 @@ AUTHOR_NAME = "Tom Norton"
 AUTHOR_LINKEDIN = "https://www.linkedin.com/in/tom-p-norton/"
 AUTHOR_REPO = "https://github.com/tom-norton/gtm-health-diagnostic"
 
-# ── data ─────────────────────────────────────────────────────────────────────
-load_data = st.cache_data(_load_data)
-agg_df, df = load_data()
-
-
 def get_anthropic_api_key():
     try:
         return st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
         return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def get_hubspot_token():
+    try:
+        return st.secrets["HUBSPOT_ACCESS_TOKEN"]
+    except Exception:
+        return os.environ.get("HUBSPOT_ACCESS_TOKEN")
+
+
+# ── sidebar: data source ─────────────────────────────────────────────────────
+st.sidebar.header("Data Source")
+data_source = st.sidebar.radio(
+    "Data source", ["Demo Data", "Live HubSpot"], label_visibility="collapsed",
+)
+st.sidebar.caption(
+    "Live HubSpot reads real deals tagged with the bowtie_stage property from "
+    "your own portal — see docs/hubspot-setup.md. Falls back to Demo Data "
+    "automatically if it isn't configured."
+)
+st.sidebar.markdown("---")
+
+# ── data ─────────────────────────────────────────────────────────────────────
+load_demo_data = st.cache_data(_load_data)
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching deals from HubSpot...")
+def load_hubspot_data(token):
+    return fetch_hubspot_data(token)
+
+
+live_mode = False
+if data_source == "Live HubSpot":
+    try:
+        agg_df, df = load_hubspot_data(get_hubspot_token())
+        live_mode = True
+    except HubSpotConfigError as e:
+        st.sidebar.warning(f"Live HubSpot unavailable — showing Demo Data instead.\n\n{e}")
+        agg_df, df = load_demo_data()
+else:
+    agg_df, df = load_demo_data()
 
 
 # ── sidebar: company profile ────────────────────────────────────────────────
@@ -282,6 +318,14 @@ st.markdown(
     f"(Selection → Expansion) · {len(segments)} segment(s) · {len(motions)} motion(s) · "
     f"{len(selected_cohorts)} cohort(s)"
 )
+
+if live_mode:
+    st.info(
+        "**Live HubSpot mode.** Deal volume and ARR from Selection onward are "
+        "your portal's real, tagged deals. HubSpot deals don't represent the "
+        "pre-deal Awareness/Education stages, so those two blocks read zero "
+        "here — switch to Demo Data to see the full eight-stage funnel."
+    )
 
 tabs = st.tabs([
     "Bowtie Funnel",

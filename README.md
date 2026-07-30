@@ -33,8 +33,10 @@ metrics/       Pure computation, no Streamlit import: stage volumes, conversion
                rates, NRR/GRR, z-score anomalies, the bowtie chart's data prep.
                Single source of truth — app.py, advisor/tools.py, and
                mcp_server/server.py all call the same functions.
-data/          generate.py (the seeded synthetic-data generator) and
-               loader.py (CSV -> the two dataframes everything else uses).
+data/          generate.py (the seeded synthetic-data generator), loader.py
+               (CSV -> the two dataframes everything else uses), and
+               hubspot_source.py (the Live HubSpot connector — same two
+               dataframes, built from a real portal's Deals API instead).
 advisor/       The diagnostic advisor: persona.py (system-prompt persona),
                tools.py (the three tools + their handlers), context.py
                (system-prompt assembly), loop.py (the tool-use loop).
@@ -42,11 +44,14 @@ charts/        Plotly figure builders. Only the bowtie diagram gets its own
                module — the simpler per-tab charts stay inline in app.py.
 mcp_server/    Standalone MCP server exposing the same three tools to
                Claude Desktop or any other MCP client. See below.
-tests/         pytest over metrics/ and advisor/tools.py, run in CI on
-               every push (.github/workflows/tests.yml).
-app.py         Streamlit UI only — five tabs, sidebar filters, the chat
-               surface. Imports everything else; defines nothing itself
-               beyond page config, CSS, and the chat loop's glue code.
+tests/         pytest over metrics/, advisor/tools.py and
+               data/hubspot_source.py, run in CI on every push
+               (.github/workflows/tests.yml).
+docs/          hubspot-setup.md — click-by-click HubSpot connector setup.
+app.py         Streamlit UI only — five tabs, sidebar filters, the Demo/
+               Live data-source toggle, the chat surface. Imports
+               everything else; defines nothing itself beyond page config,
+               CSS, and glue code.
 ```
 
 ## Architecture
@@ -131,6 +136,14 @@ This matters concretely: summing `deal_value` across a deal's postsale rows woul
 
 The generator also injects one deliberate, real anomaly — an Enterprise/Sales-led win-rate collapse in a specific quarter — so the anomaly detector on the Conversion Rates tab has something genuine to find rather than a permanently clean bill of health. Every other quarter is left to ordinary sampling noise, which produces its own smaller, unplanned anomalies alongside the injected one.
 
+## HubSpot connector
+
+A sidebar toggle switches the whole app between the synthetic dataset and a real HubSpot portal's Deals, via `data/hubspot_source.py`. Setup is in **[docs/hubspot-setup.md](docs/hubspot-setup.md)** — a click-by-click guide, including the exact private-app scopes and the custom deal properties the connector expects.
+
+The connector maps deals onto the bowtie via one custom dropdown property, `bowtie_stage` (Selection → Expansion — the six stages a HubSpot deal can meaningfully represent; Awareness/Education stay synthetic-only, since they aren't deals). The interesting part is *how* it reconstructs a transition log rather than a single current-stage snapshot: it calls the Deals API with `propertiesWithHistory=bowtie_stage`, which returns every value that property has ever held, each timestamped. Sorting that list and turning each consecutive pair into a row — stage entered, stage exited into, days between the two timestamps — produces exactly the same multi-row-per-deal shape `data/generate.py` produces. Nothing downstream needed to change: `metrics/`, `advisor/` and `charts/` don't know or care whether a row came from a CSV or a live API call. That was the design goal from the start — a data source swap, not a rewrite.
+
+Live mode degrades to Demo Data automatically, with a specific sidebar message, on every failure mode: no token configured, an invalid or under-scoped token, or a connected portal with no deals yet tagged — never a stack trace. `tests/test_hubspot_source.py` covers the property-history reconstruction (including out-of-order and duplicate history entries) and every one of those failure paths against a mocked API, since there's no way to unit-test against a real portal.
+
 ## What I deliberately did not build
 
 Naming what was left out, and why, matters as much as what shipped.
@@ -141,7 +154,7 @@ Naming what was left out, and why, matters as much as what shipped.
 
 **No claim that this is an EU AI Act high-risk system, and no design that would make it one.** Revenue funnel diagnostics is not a listed high-risk use case. It would move toward one if it were extended to score individuals in an employment context, so that specific extension is off the roadmap rather than merely unimplemented. Transparency obligations still apply: the advisor is clearly labelled as AI-generated output and every number it cites is visible in the dashboard above it.
 
-**No data leaves the session.** The demo runs on synthetic data. Nothing is stored, no chat history is persisted server-side, and there is no analytics or tracking layer. When the HubSpot connector lands, credentials will live in local secrets and never in the repository.
+**No data leaves the session.** The demo runs on synthetic data. Nothing is stored, no chat history is persisted server-side, and there is no analytics or tracking layer. The HubSpot connector reads only — it has no write scope and cannot modify a portal — and its access token lives in local secrets, never in the repository. See [docs/hubspot-setup.md](docs/hubspot-setup.md) for why it's meant to run against a developer sandbox rather than production customer data.
 
 **No unbounded API spend.** The public demo caps advisor questions per browser session, because it runs on a personal API key. It is a courtesy limit, not a security control.
 
@@ -160,19 +173,20 @@ Naming what was left out, and why, matters as much as what shipped.
 pip install -r requirements.txt
 ```
 
-Add your Anthropic API key to `.streamlit/secrets.toml`:
+Add your Anthropic API key — and, optionally, a HubSpot private-app access token if you want Live mode (see [docs/hubspot-setup.md](docs/hubspot-setup.md)) — to `.streamlit/secrets.toml`:
 
 ```toml
 ANTHROPIC_API_KEY = "sk-ant-..."
+HUBSPOT_ACCESS_TOKEN = "pat-..."
 ```
 
-Or set it as an environment variable. Then:
+Or set either as an environment variable. Then:
 
 ```bash
 streamlit run app.py
 ```
 
-The dashboard loads fully without a key; only the advisor requires one.
+The dashboard loads fully without either key; only the advisor requires the Anthropic one, and only Live HubSpot mode requires the HubSpot one — leaving it unset just keeps the Data Source toggle on Demo Data.
 
 To regenerate the dataset (e.g. after changing a parameter in `data/generate.py`):
 
@@ -191,12 +205,13 @@ pytest tests/ -v
 
 ## Roadmap
 
-**Next: HubSpot connector.** A Demo/Live toggle pulling deals from a developer sandbox via the Deals API, mapping pipeline stages to bowtie stages through a custom property. The diagnostic logic does not change; it is a data source swap.
+**Next: whole-project explainers.** Written walkthroughs of every module — architecture, data model, metrics, charts, the advisor prompt clause by clause, tool calling and MCP in plain English, HubSpot, a glossary — plus a Loom script and a LinkedIn case-study writeup.
 
 **Done:**
 - A seeded, committed data generator (`data/generate.py`) replaced the opaque CSV — entity-stable `deal_id`s tracing a deal across every stage it occupied, churn weighted to Renewal where the advisor's own benchmarks say it belongs, and separate PLG / Sales-led cohorts so the motion filter and the advisor's PLG-specific reasoning both draw on data that actually exists.
 - The advisor moved from a single context-stuffed prompt to a real tool-use loop over `get_stage_health`, `diagnose_conversion_drop` and `recommend_play`, and those same tools now run as a standalone MCP server for Claude Desktop — see [Tool calling and MCP](#tool-calling-and-mcp).
 - The codebase split into `metrics/`, `data/`, `advisor/`, `charts/` and `mcp_server/` packages with a pytest suite in CI, so the dashboard, the chat advisor, and the MCP server share one tested source of truth instead of three copies of the same arithmetic.
+- A HubSpot connector (`data/hubspot_source.py`) — a Demo/Live toggle pulling real deals from a developer sandbox via the Deals API, mapping HubSpot deals onto bowtie stages through a custom property, with property-history reconstruction so the same conversion, velocity and retention math runs unmodified — see [HubSpot connector](#hubspot-connector).
 
 ---
 
