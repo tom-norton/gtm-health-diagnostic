@@ -47,7 +47,8 @@ mcp_server/    Standalone MCP server exposing the same three tools to
 tests/         pytest over metrics/, advisor/tools.py and
                data/hubspot_source.py, run in CI on every push
                (.github/workflows/tests.yml).
-docs/          hubspot-setup.md — click-by-click HubSpot connector setup.
+docs/          Whole-project explainers (01-08), hubspot-setup.md, and the
+               Loom script / LinkedIn draft. See "Explainers" below.
 app.py         Streamlit UI only — five tabs, sidebar filters, the Demo/
                Live data-source toggle, the chat surface. Imports
                everything else; defines nothing itself beyond page config,
@@ -203,15 +204,31 @@ pip install pytest
 pytest tests/ -v
 ```
 
-## Roadmap
+## Explainers
 
-**Next: whole-project explainers.** Written walkthroughs of every module — architecture, data model, metrics, charts, the advisor prompt clause by clause, tool calling and MCP in plain English, HubSpot, a glossary — plus a Loom script and a LinkedIn case-study writeup.
+This README covers the what and the headline why. For the whole project walked through in detail — written to be read aloud in an interview, not just skimmed — see `docs/`:
+
+1. [Architecture](docs/01-architecture.md) — how the packages fit together, and why the boundaries are drawn where they are
+2. [Data model](docs/02-data-model.md) — the transition-log schema, the snapshot problem, entity-stable deal IDs
+3. [Metrics](docs/03-metrics.md) — every calculation, module by module: conversion rates, the bowtie's own aggregation, the two-part anomaly test
+4. [Charts](docs/04-charts.md) — why the bowtie diagram is hand-drawn and log-scaled, and why the simpler charts aren't
+5. [The advisor prompt, clause by clause](docs/05-advisor-prompt.md) — what each section of the persona is for and what breaks without it
+6. [Tool calling and MCP, in plain English](docs/06-tool-calling-and-mcp.md) — workflow vs. agent, what happens on the wire, and authoring an MCP server rather than just consuming one
+7. [HubSpot, and why it's built the way it is](docs/07-hubspot.md) — the design decisions behind the connector (setup steps are in [hubspot-setup.md](docs/hubspot-setup.md))
+8. [Glossary](docs/08-glossary.md) — every term this project uses precisely, in one place
+
+Plus [a Loom walkthrough script](docs/loom-script.md) and [a LinkedIn case-study draft](docs/linkedin-post.md).
+
+## Roadmap
 
 **Done:**
 - A seeded, committed data generator (`data/generate.py`) replaced the opaque CSV — entity-stable `deal_id`s tracing a deal across every stage it occupied, churn weighted to Renewal where the advisor's own benchmarks say it belongs, and separate PLG / Sales-led cohorts so the motion filter and the advisor's PLG-specific reasoning both draw on data that actually exists.
 - The advisor moved from a single context-stuffed prompt to a real tool-use loop over `get_stage_health`, `diagnose_conversion_drop` and `recommend_play`, and those same tools now run as a standalone MCP server for Claude Desktop — see [Tool calling and MCP](#tool-calling-and-mcp).
 - The codebase split into `metrics/`, `data/`, `advisor/`, `charts/` and `mcp_server/` packages with a pytest suite in CI, so the dashboard, the chat advisor, and the MCP server share one tested source of truth instead of three copies of the same arithmetic.
 - A HubSpot connector (`data/hubspot_source.py`) — a Demo/Live toggle pulling real deals from a developer sandbox via the Deals API, mapping HubSpot deals onto bowtie stages through a custom property, with property-history reconstruction so the same conversion, velocity and retention math runs unmodified — see [HubSpot connector](#hubspot-connector).
+- Whole-project written explainers (`docs/01`–`08`), a Loom walkthrough script, and a LinkedIn case-study draft — see [Explainers](#explainers).
+
+**Next:** recording the actual Loom video and posting the LinkedIn writeup — both are ready to go in `docs/`, the rest is just pressing record and publish.
 
 ---
 
