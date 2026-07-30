@@ -156,6 +156,21 @@ def test_fetch_deals_with_history_follows_pagination_cursor(monkeypatch):
     assert calls == [None, "cursor-2"]
 
 
+def test_fetch_deals_with_history_requests_at_most_50_per_page(monkeypatch):
+    # HubSpot rejects limit > 50 on any request that includes
+    # propertiesWithHistory (400 VALIDATION_ERROR) -- regression coverage for
+    # that exact failure.
+    seen_limits = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        seen_limits.append(params["limit"])
+        return FakeResponse(200, {"results": [_deal("1", [])]})
+
+    monkeypatch.setattr("data.hubspot_source.requests.get", fake_get)
+    _fetch_deals_with_history("token")
+    assert all(limit <= 50 for limit in seen_limits)
+
+
 def test_fetch_owners_builds_id_to_name_map(monkeypatch):
     def fake_get(url, headers=None, params=None, timeout=None):
         return FakeResponse(200, {"results": [
