@@ -646,59 +646,68 @@ with tabs[3]:
             "churned_pct": round(grp["churned"].mean() * 100, 1),
         })
 
-    cm = pd.DataFrame(cohort_metrics).sort_values("cohort_quarter")
+    if not cohort_metrics:
+        st.info(
+            "No deals in a postsale stage (Onboarding, Adoption, Renewal or "
+            "Expansion) in the current filter, so there's no NRR/GRR to "
+            "compute yet. This is expected with a small or early-stage "
+            "dataset — e.g. a HubSpot portal whose tagged deals haven't "
+            "reached Onboarding."
+        )
+    else:
+        cm = pd.DataFrame(cohort_metrics).sort_values("cohort_quarter")
 
-    fig_nrr = go.Figure()
-    fig_nrr.add_trace(go.Bar(
-        x=cm["cohort_quarter"], y=cm["GRR"],
-        name="GRR", marker_color=MM_COLOR,
-        hovertemplate="%{x}<br>GRR: %{y:.1f}%<extra></extra>",
-    ))
-    fig_nrr.add_trace(go.Scatter(
-        x=cm["cohort_quarter"], y=cm["NRR"],
-        name="NRR", mode="lines+markers",
-        line=dict(color=POSTSALE_COLOR, width=3),
-        marker=dict(size=8),
-        hovertemplate="%{x}<br>NRR: %{y:.1f}%<extra></extra>",
-    ))
-    fig_nrr.add_hline(y=100, line_dash="dash", line_color=HAIRLINE,
-                      annotation_text="100%", annotation_position="top left")
-    fig_nrr.update_layout(
-        yaxis=dict(title="Rate (%)", range=[80, max(cm["NRR"].max(), 115) + 5]),
-        xaxis_tickangle=-30,
-        plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
-        height=400, margin=dict(t=20, b=80), legend=dict(x=0.01, y=0.99),
-    )
-    st.plotly_chart(fig_nrr, use_container_width=True)
+        fig_nrr = go.Figure()
+        fig_nrr.add_trace(go.Bar(
+            x=cm["cohort_quarter"], y=cm["GRR"],
+            name="GRR", marker_color=MM_COLOR,
+            hovertemplate="%{x}<br>GRR: %{y:.1f}%<extra></extra>",
+        ))
+        fig_nrr.add_trace(go.Scatter(
+            x=cm["cohort_quarter"], y=cm["NRR"],
+            name="NRR", mode="lines+markers",
+            line=dict(color=POSTSALE_COLOR, width=3),
+            marker=dict(size=8),
+            hovertemplate="%{x}<br>NRR: %{y:.1f}%<extra></extra>",
+        ))
+        fig_nrr.add_hline(y=100, line_dash="dash", line_color=HAIRLINE,
+                          annotation_text="100%", annotation_position="top left")
+        fig_nrr.update_layout(
+            yaxis=dict(title="Rate (%)", range=[80, max(cm["NRR"].max(), 115) + 5]),
+            xaxis_tickangle=-30,
+            plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
+            height=400, margin=dict(t=20, b=80), legend=dict(x=0.01, y=0.99),
+        )
+        st.plotly_chart(fig_nrr, use_container_width=True)
 
-    # ARR waterfall by cohort
-    st.markdown("#### ARR Waterfall: Base vs Churn vs Expansion")
-    fig_wf = go.Figure()
-    fig_wf.add_trace(go.Bar(
-        x=cm["cohort_quarter"], y=cm["base_arr"] / 1e6,
-        name="Base ARR", marker_color=MM_COLOR,
-    ))
-    fig_wf.add_trace(go.Bar(
-        x=cm["cohort_quarter"], y=-cm["churn_arr"] / 1e6,
-        name="Churned ARR", marker_color="#ff6b5a",
-    ))
-    fig_wf.add_trace(go.Bar(
-        x=cm["cohort_quarter"], y=cm["expansion_arr"] / 1e6,
-        name="Expansion ARR", marker_color=POSTSALE_COLOR,
-    ))
-    fig_wf.update_layout(
-        barmode="relative",
-        yaxis_title="ARR (€M)",
-        xaxis_tickangle=-30,
-        plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
-        height=350, margin=dict(t=10, b=80),
-    )
-    st.plotly_chart(fig_wf, use_container_width=True)
+        # ARR waterfall by cohort
+        st.markdown("#### ARR Waterfall: Base vs Churn vs Expansion")
+        fig_wf = go.Figure()
+        fig_wf.add_trace(go.Bar(
+            x=cm["cohort_quarter"], y=cm["base_arr"] / 1e6,
+            name="Base ARR", marker_color=MM_COLOR,
+        ))
+        fig_wf.add_trace(go.Bar(
+            x=cm["cohort_quarter"], y=-cm["churn_arr"] / 1e6,
+            name="Churned ARR", marker_color="#ff6b5a",
+        ))
+        fig_wf.add_trace(go.Bar(
+            x=cm["cohort_quarter"], y=cm["expansion_arr"] / 1e6,
+            name="Expansion ARR", marker_color=POSTSALE_COLOR,
+        ))
+        fig_wf.update_layout(
+            barmode="relative",
+            yaxis_title="ARR (€M)",
+            xaxis_tickangle=-30,
+            plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG, font_color=CHART_FONT,
+            height=350, margin=dict(t=10, b=80),
+        )
+        st.plotly_chart(fig_wf, use_container_width=True)
 
-    # Table
-    display_cm = cm[["cohort_quarter", "GRR", "NRR", "churned_pct"]].copy()
-    display_cm.columns = ["Cohort", "GRR (%)", "NRR (%)", "Churn Rate (%)"]
-    st.dataframe(display_cm, use_container_width=True, hide_index=True)
+        # Table
+        display_cm = cm[["cohort_quarter", "GRR", "NRR", "churned_pct"]].copy()
+        display_cm.columns = ["Cohort", "GRR (%)", "NRR (%)", "Churn Rate (%)"]
+        st.dataframe(display_cm, use_container_width=True, hide_index=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
