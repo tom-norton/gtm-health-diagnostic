@@ -1,0 +1,30 @@
+name: Keep live demo awake
+
+# Streamlit Community Cloud puts an app to sleep after a stretch with no
+# traffic, and the cold-start (dependency install + reboot) can take 30-60+
+# seconds -- long enough that a recruiter clicking the link once could see a
+# "waking up" screen and assume the project is broken. Pinging on a short,
+# regular interval keeps the app registering recent traffic so it never
+# crosses that inactivity threshold in the first place.
+#
+# This prevents the sleep, it doesn't reverse it: if the app has already gone
+# to sleep (Actions was paused, a run was skipped, etc.), a plain GET here
+# just hits the static "this app is sleeping" page rather than actually
+# rebooting it -- waking it back up still needs a real visit through the
+# browser. GitHub also auto-disables scheduled workflows after 60 days with
+# no commits to the repo, so this needs occasional repo activity to keep
+# firing over a long gap.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the live demo
+        run: |
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" --max-time 30 \
+            "https://gtm-health-diagnostic-eumwua5bjieoxuxtrwyaar.streamlit.app/"
