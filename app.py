@@ -250,7 +250,11 @@ else:
 
 # ── sidebar: company profile ────────────────────────────────────────────────
 st.sidebar.header("Company Profile")
-st.sidebar.caption("Used by the diagnostic advisor to pick the right benchmarks.")
+st.sidebar.caption(
+    "Tells the advisor which benchmark row to argue from — it does not "
+    "change which deals are shown or analyzed. Use Filters below to narrow "
+    "the data itself."
+)
 
 # The bands are the published Winning by Design Table 6.2 rows, which are
 # denominated in USD. The dataset itself is in EUR — the advisor is told about
@@ -272,6 +276,7 @@ st.sidebar.markdown("---")
 
 # ── sidebar filters ───────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
+st.sidebar.caption("This is what actually narrows every chart and the advisor's data.")
 
 segments = st.sidebar.multiselect(
     "Segment", options=SEGMENTS, default=SEGMENTS,
