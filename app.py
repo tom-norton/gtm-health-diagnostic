@@ -251,9 +251,8 @@ else:
 # ── sidebar: company profile ────────────────────────────────────────────────
 st.sidebar.header("Company Profile")
 st.sidebar.caption(
-    "Tells the advisor which benchmark row to argue from — it does not "
-    "change which deals are shown or analyzed. Use Filters below to narrow "
-    "the data itself."
+    "Tells the advisor about your company so it knows who to benchmark you "
+    "against. Use Filters below to narrow the data itself."
 )
 
 # The bands are the published Winning by Design Table 6.2 rows, which are
