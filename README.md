@@ -47,6 +47,9 @@ mcp_server/    Standalone MCP server exposing the same three tools to
 tests/         pytest over metrics/, advisor/tools.py and
                data/hubspot_source.py, run in CI on every push
                (.github/workflows/tests.yml).
+docs/          hubspot-setup.md (click-by-click HubSpot connector setup)
+               and mcp-setup.md (connecting Claude Desktop, written for a
+               non-technical reader).
 app.py         Streamlit UI only — five tabs, sidebar filters, the Demo/
                Live data-source toggle, the chat surface. Imports
                everything else; defines nothing itself beyond page config,
@@ -90,7 +93,7 @@ The loop itself (`advisor/loop.py`) is a **hand-rolled request → tool call →
 
 **Consuming an MCP server is table stakes; authoring one is the actual credibility signal.** `mcp_server/server.py` exposes the same three tools — backed by the identical handler functions in `advisor/tools.py` — over the Model Context Protocol, so Claude Desktop (or any other MCP client) can query this dataset directly, with no Streamlit app in the loop at all.
 
-To run it locally and wire it into Claude Desktop:
+Prefer a guided, click-by-click walkthrough (no terminal experience assumed)? See **[docs/mcp-setup.md](docs/mcp-setup.md)**. The quick version:
 
 ```bash
 pip install -r mcp_server/requirements.txt
@@ -137,7 +140,7 @@ The generator also injects one deliberate, real anomaly — an Enterprise/Sales-
 
 ## HubSpot connector
 
-A sidebar toggle switches the whole app between the synthetic dataset and a real HubSpot portal's Deals, via `data/hubspot_source.py`. It reads a custom `bowtie_stage` deal property (plus a handful of supporting custom properties) through a HubSpot private app scoped to `crm.objects.deals.read` and `crm.objects.owners.read` — see `data/hubspot_source.py` for the full property list and scopes.
+A sidebar toggle switches the whole app between the synthetic dataset and a real HubSpot portal's Deals, via `data/hubspot_source.py`. It reads a custom `bowtie_stage` deal property (plus a handful of supporting custom properties) through a HubSpot private app scoped to `crm.objects.deals.read` and `crm.objects.owners.read`. For click-by-click setup — creating the properties, the private app, the exact scopes — see **[docs/hubspot-setup.md](docs/hubspot-setup.md)**.
 
 The connector maps deals onto the bowtie via one custom dropdown property, `bowtie_stage` (Selection → Expansion — the six stages a HubSpot deal can meaningfully represent; Awareness/Education stay synthetic-only, since they aren't deals). The interesting part is *how* it reconstructs a transition log rather than a single current-stage snapshot: it calls the Deals API with `propertiesWithHistory=bowtie_stage`, which returns every value that property has ever held, each timestamped. Sorting that list and turning each consecutive pair into a row — stage entered, stage exited into, days between the two timestamps — produces exactly the same multi-row-per-deal shape `data/generate.py` produces. Nothing downstream needed to change: `metrics/`, `advisor/` and `charts/` don't know or care whether a row came from a CSV or a live API call. That was the design goal from the start — a data source swap, not a rewrite.
 
@@ -172,7 +175,7 @@ Naming what was left out, and why, matters as much as what shipped.
 pip install -r requirements.txt
 ```
 
-Add your Anthropic API key — and, optionally, a HubSpot private-app access token if you want Live mode — to `.streamlit/secrets.toml`:
+Add your Anthropic API key — and, optionally, a HubSpot private-app access token if you want Live mode (see [docs/hubspot-setup.md](docs/hubspot-setup.md)) — to `.streamlit/secrets.toml`:
 
 ```toml
 ANTHROPIC_API_KEY = "sk-ant-..."

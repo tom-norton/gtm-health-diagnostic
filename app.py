@@ -222,8 +222,8 @@ data_source = st.sidebar.radio(
 )
 st.sidebar.caption(
     "Live HubSpot reads real deals tagged with a custom bowtie_stage property "
-    "via the HubSpot API. Falls back to Demo Data automatically if it isn't "
-    "configured."
+    f"via the HubSpot API. [Setup guide]({AUTHOR_REPO}/blob/main/docs/hubspot-setup.md). "
+    "Falls back to Demo Data automatically if it isn't configured."
 )
 st.sidebar.markdown("---")
 

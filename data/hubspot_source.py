@@ -2,8 +2,8 @@
 portal's Deals. The diagnostic logic downstream (metrics/, advisor/,
 charts/) does not change at all -- this module's only job is to hand back
 two dataframes shaped exactly like data.loader.load_data()'s, built from
-deals that carry a handful of custom bowtie_* properties (see
-DEAL_PROPERTIES below for the full list).
+deals that carry the custom bowtie_* properties described in
+docs/hubspot-setup.md.
 
 Scoped to Selection -> Expansion (metrics.constants.DEAL_STAGES). HubSpot
 deals don't naturally represent the pre-deal Awareness/Education stages, so
@@ -70,14 +70,14 @@ def _get(url, access_token, params):
     if resp.status_code == 401:
         raise HubSpotConfigError(
             "HubSpot rejected the access token (401 Unauthorized). It may be "
-            "wrong, expired, or rotated."
+            "wrong, expired, or rotated -- see docs/hubspot-setup.md."
         )
     if resp.status_code == 403:
         raise HubSpotConfigError(
             "HubSpot accepted the token but refused the request (403 "
             "Forbidden) -- the private app is most likely missing a required "
             "scope. It needs both crm.objects.deals.read and "
-            "crm.objects.owners.read."
+            "crm.objects.owners.read. See docs/hubspot-setup.md, 'Scopes.'"
         )
     if resp.status_code >= 400:
         raise HubSpotConfigError(f"HubSpot API error {resp.status_code}: {resp.text[:300]}")
@@ -204,7 +204,9 @@ def fetch_hubspot_data(access_token):
     (never a raw requests/HTTP exception) for every failure mode, so callers
     can catch one exception type and fall back to Demo Data."""
     if not access_token:
-        raise HubSpotConfigError("No HubSpot access token configured.")
+        raise HubSpotConfigError(
+            "No HubSpot access token configured -- see docs/hubspot-setup.md."
+        )
 
     owners = _fetch_owners(access_token)
     deals = _fetch_deals_with_history(access_token)
@@ -216,8 +218,8 @@ def fetch_hubspot_data(access_token):
     if not rows:
         raise HubSpotConfigError(
             "Connected to HubSpot, but found no deals with a bowtie_stage "
-            "value set. Tag at least one deal with that property to test "
-            "Live mode."
+            "value set. Tag at least one deal with that property -- see "
+            "docs/hubspot-setup.md, 'Tag a deal to test it.'"
         )
 
     deal_df = pd.DataFrame(rows, columns=DEAL_COLUMNS)
